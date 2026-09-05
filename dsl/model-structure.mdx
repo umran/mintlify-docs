@@ -33,7 +33,7 @@ Every Conseqa model is a single YAML file whose root object is a `Model`. The fi
 </ParamField>
 
 <ParamField path="operations" type="map[Id → Operation]" required>
-  A map of operation declarations. Each operation belongs to one service and declares inputs, effects, transactions, a program, and requirements to verify. Required even when empty (`operations: {}`).
+  A map of operation declarations. Each operation belongs to one service and declares inputs, a program (which inlines transactions, direct effects, effect intents, and transaction outputs at their execution or establishment sites), and requirements to verify. Required even when empty (`operations: {}`).
 </ParamField>
 
 ---
@@ -154,10 +154,6 @@ operations:
         result:
           ok: schema.CreateOrderResponse
           err: schema.RequestRejected
-    effects: {}
-    effect_intents: {}
-    transaction_outputs: {}
-    transactions: {}
     program:
       steps:
         - kind: complete

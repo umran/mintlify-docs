@@ -46,42 +46,58 @@ The `video_streaming.yaml` fixture models a pipeline where clients upload videos
 ### `complete_upload` — keyed commit plus intent recovery
 
 ```yaml
-transactions:
-  tx.complete_upload.register:
-    data_model: data.videos
-    isolation: read_committed
-    idempotency:
-      kind: deduplicated_by
-      key:
-        components:
-          - source: input:input.complete_upload.request
-            path: upload_id
-    steps:
-      - kind: insert
-        object: object.video
-        values:
-          kind: deterministic
-          from:
-            - source: input:input.complete_upload.request
-              path: video_id
-            - source: input:input.complete_upload.request
-              path: owner_id
-            - source: input:input.complete_upload.request
-              path: source_uri
-      - kind: establish_effect_intent
-        intent: intent.complete_upload.publish_uploaded
-        values:
-          kind: deterministic
-          from:
+program:
+  steps:
+    - kind: transaction
+      id: tx.complete_upload.register
+      data_model: data.videos
+      isolation: read_committed
+      idempotency:
+        kind: deduplicated_by
+        key:
+          components:
             - source: input:input.complete_upload.request
               path: upload_id
-            - source: input:input.complete_upload.request
-              path: video_id
+      steps:
+        - kind: insert
+          object: object.video
+          values:
+            kind: deterministic
+            from:
+              - source: input:input.complete_upload.request
+                path: video_id
+              - source: input:input.complete_upload.request
+                path: owner_id
+              - source: input:input.complete_upload.request
+                path: source_uri
+        - kind: establish_effect_intent
+          bind: intent.complete_upload.publish_uploaded
+          effect_id: effect.complete_upload.publish_uploaded
+          effect:
+            kind: publication
+            topic: topic.video_events
+            schema: schema.VideoUploaded
+            idempotency_key_propagation:
+              - source:
+                  components:
+                    - source: input:input.complete_upload.request
+                      path: upload_id
+                target:
+                  components:
+                    - source: effect:effect.complete_upload.publish_uploaded
+                      path: event_id
+          values:
+            kind: deterministic
+            from:
+              - source: input:input.complete_upload.request
+                path: upload_id
+              - source: input:input.complete_upload.request
+                path: video_id
 ```
 
-The transaction is `deduplicated_by` the request's `upload_id`, which is also the idempotency key. This means:
+The inline transaction is `deduplicated_by` the request's `upload_id`, which is also the idempotency key. The `establish_effect_intent` step declares the publication contract inline, captures its concrete payload from `values`, and binds the intent, all atomically with the commit. This means:
 
-- A second attempt under the same `upload_id` resolves the prior commit and restores `intent.complete_upload.publish_uploaded` without re-inserting the video record.
+- A second attempt under the same `upload_id` resolves the prior commit and restores the `intent.complete_upload.publish_uploaded` binding without re-inserting the video record.
 - The intent instance is recovered from the keyed commit, so even if the process crashes between the commit and the `execute_effect_intent` step, a retry delivers the same logical `VideoUploaded` message.
 
 The request also declares a keyed identity on `upload_id`:
@@ -100,11 +116,12 @@ This declares that any two requests with the same `upload_id` present equal payl
 
 ### `transcode_video` — external deduplication fixes the control decision
 
-`transcode_video` is the most interesting case. It calls an external transcoding engine and branches on the result:
+`transcode_video` is the most interesting case. It calls an external transcoding engine and branches on the result. The engine's contract is declared inline at the `execute_effect` site:
 
 ```yaml
-effects:
-  effect.transcode_video.engine:
+- kind: execute_effect
+  effect_id: effect.transcode_video.engine
+  effect:
     kind: external
     name: transcoding-engine.render
     idempotency:
@@ -118,6 +135,14 @@ effects:
       err:
         schema: schema.RenderFailed
         disposition: terminal
+  values:
+    kind: deterministic
+    from:
+      - source: input:input.transcode_video.uploaded
+        path: video_id
+      - source: input:input.transcode_video.uploaded
+        path: source_uri
+  bind: result.transcode_video.render
 ```
 
 Two declarations work together here:
@@ -138,8 +163,9 @@ Both downstream operations follow the same pattern as `complete_upload`: their t
 
 ```yaml
 # notify_published — external push gateway deduplicates by event_id
-effects:
-  effect.notify_published.push:
+- kind: execute_effect
+  effect_id: effect.notify_published.push
+  effect:
     kind: external
     name: push-gateway.notify
     idempotency:
@@ -149,6 +175,11 @@ effects:
           - source: input:input.notify_published.published
             path: event_id
     result: null
+  values:
+    kind: deterministic
+    from:
+      - source: input:input.notify_published.published
+        path: event_id
 ```
 
 The push gateway declares `deduplicated_by` the subscription's `event_id`. Because `event_id` is the message identity field on `topic.video_events`, and the governing key is the subscription's `event_id`, the key component is replay-stable. The external boundary collapses duplicate executions under the same key.
@@ -167,7 +198,7 @@ key:
       path: some_id
 ```
 
-Transaction-read results are local to the transaction execution that produced them and are always treated as unknown for replay purposes.
+Transaction-read bindings are local to the transaction execution that produced them and are always treated as unknown for replay purposes.
 
 ## Going from `unknown` to `proven`
 

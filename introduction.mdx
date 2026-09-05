@@ -63,7 +63,7 @@ A Conseqa model is a YAML file with a fixed set of top-level keys:
 | `data_models` | Logical transactional state boundaries containing persistent objects. |
 | `topics` | Message channels with declared ordering and identity guarantees. |
 | `state_machines` | Object lifecycle graphs with declared transitions and side effects. |
-| `operations` | Units of application behavior: inputs, effects, transactions, a program, and requirements. |
+| `operations` | Units of application behavior: inputs, a causal program that inlines transactions and effects at their execution sites, and requirements. |
 
 A structurally valid model is not necessarily a safe one. Validation establishes coherence; verification establishes whether requirements follow from the declared facts.
 

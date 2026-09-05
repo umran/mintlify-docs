@@ -76,7 +76,7 @@ A transition fires inside a `transition` transaction step. The operation that ap
 
 ### Side effects
 
-Transition side effects are effect declarations that are automatically established as effect intents when the transition fires inside a transaction. The operation declares a corresponding `effect_intents` entry to name the intent artifact, and supplies a `effect_values` derivation at the transition step that provides the payload for that intent.
+Transition side effects are effect declarations that the transition owns as part of the shared state-machine contract. When an operation's transaction applies the transition, those side effects are automatically established as effect intents. The applying `transition` step supplies, for every side effect, the concrete payload derivation and an operation-local intent binding, all in one place.
 
 ```yaml
 transitions:
@@ -92,7 +92,7 @@ transitions:
         idempotency_key_propagation: []
 ```
 
-When an operation applies `transition.video.mark_ready`, it must supply `effect_values` for `effect.video.published` in the transition step:
+When an operation applies `transition.video.mark_ready`, its `transition` step must supply an `effect_intents` entry for `effect.video.published` with a `bind` (the operation-local intent name) and a `values` derivation:
 
 ```yaml
 - kind: transition
@@ -106,24 +106,27 @@ When an operation applies `transition.video.mark_ready`, it must supply `effect_
       value:
         source: input:input.publish_video.completed
         path: video_id
-  effect_values:
+  effect_intents:
     effect.video.published:
-      kind: deterministic
-      from:
-        - source: input:input.publish_video.completed
-          path: event_id
-        - source: input:input.publish_video.completed
-          path: video_id
-        - source: input:input.publish_video.completed
-          path: manifest_uri
+      bind: intent.publish_video.published
+      values:
+        kind: deterministic
+        from:
+          - source: input:input.publish_video.completed
+            path: event_id
+          - source: input:input.publish_video.completed
+            path: video_id
+          - source: input:input.publish_video.completed
+            path: manifest_uri
 ```
 
-The operation must also declare an `effect_intents` entry that names the side effect's intent. The artifact is then available through `execute_effect_intent` in the program.
+The map's key is the state-machine transition side-effect ID. Coverage must be exact: the set of keys in `effect_intents` must match the set of `side_effects` on the transition, and each entry supplies exactly one `values` derivation and one operation-local intent binding.
+
+After a successful commit, the bound intent is available anywhere in the operation's program where it is definitely established. Execute it with `execute_effect_intent`:
 
 ```yaml
-effect_intents:
-  intent.publish_video.published:
-    effect: effect.video.published
+- kind: execute_effect_intent
+  intent: intent.publish_video.published
 ```
 
 <Note>
@@ -150,7 +153,39 @@ A typical pattern for state-machine-driven operations is:
 program:
   steps:
     - kind: transaction
-      transaction: tx.publish_video.ready
+      id: tx.publish_video.ready
+      data_model: data.videos
+      isolation: read_committed
+      idempotency:
+        kind: deduplicated_by
+        key:
+          components:
+            - source: input:input.publish_video.completed
+              path: event_id
+      steps:
+        - kind: transition
+          machine: machine.video_lifecycle
+          transition: transition.video.mark_ready
+          subject:
+            object: object.video
+            predicate:
+              kind: eq
+              field: video_id
+              value:
+                source: input:input.publish_video.completed
+                path: video_id
+          effect_intents:
+            effect.video.published:
+              bind: intent.publish_video.published
+              values:
+                kind: deterministic
+                from:
+                  - source: input:input.publish_video.completed
+                    path: event_id
+                  - source: input:input.publish_video.completed
+                    path: video_id
+                  - source: input:input.publish_video.completed
+                    path: manifest_uri
     - kind: execute_effect_intent
       intent: intent.publish_video.published
     - kind: complete

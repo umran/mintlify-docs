@@ -1,28 +1,51 @@
 ---
 title: "Conseqa DSL Effects: Publication, Request, External"
 sidebarTitle: "Effects"
-description: "Reference for Conseqa's three effect kinds — publication, request, and external — covering idempotency guarantees, retry semantics, and propagation."
+description: "Reference for Conseqa's three effect kinds — publication, request, and external — covering idempotency guarantees, retry semantics, and inline declaration at the execution site."
 ---
 
-Effects are how an operation interacts with the world outside its own transaction state. They cover publishing messages to topics, calling other operations, and invoking external systems. Declaring an effect in `operation.effects` is a capability declaration, not an execution: an effect runs only when a program step explicitly executes it. How the values of a particular effect instance are computed is declared at the execution site, not on the effect contract itself.
+Effects are how an operation interacts with the world outside its own transaction state. They cover publishing messages to topics, calling other operations, and invoking external systems. Effect contracts owned by an operation are **declared inline** at the exact program or transaction step that executes or establishes them. There is no operation-level effect registry; the execution site is the source of truth for both the contract and the concrete values that instance carries.
+
+State-machine transitions are the one place effect contracts live outside a specific execution site: transition side-effect contracts are shared model-level declarations owned by the state machine (see [State Machines](/concepts/state-machines)).
 
 ## Effect contracts and effect instances
 
-An effect declaration is a contract. It describes the kind of work, the destination, the schema, the retry or idempotency guarantee, and any key propagation. It does not say when the effect runs or what specific values it carries — those are fixed at each execution or establishment site:
+An effect declaration is a contract. It describes the kind of work, the destination, the schema, the retry or idempotency guarantee, and any key propagation. It does not by itself say what specific values a particular instance carries, those are fixed at each execution or establishment site:
 
-- an `execute_effect` program step constructs and runs the effect directly, with a `values` derivation;
-- an `establish_effect_intent` transaction step captures the effect as a durable artifact, also with a `values` derivation;
-- an `execute_effect_intent` program step runs a previously established intent — the values were fixed at establishment and are not recomputed.
+- an `execute_effect` program step declares the effect contract inline and runs the effect directly, with a `values` derivation;
+- an `establish_effect_intent` transaction step declares the effect contract inline, constructs one concrete effect instance from `values`, and captures it as a durable intent artifact bound by name;
+- an `execute_effect_intent` program step runs a previously established intent by binding name, the values were fixed at establishment and are not recomputed.
+
+Every operation-owned inline effect site carries an `effect_id`. That ID identifies the inline effect occurrence itself and is what `ValueSource::Effect` resolves to in idempotency-key propagation. `effect_id` values must be unique across all inline effect sites within a single operation.
 
 ---
 
 ## Publication effect
 
-A publication effect sends a message carrying one schema to one topic. Publications have no synchronous result — you cannot bind a result from executing a publication.
+A publication effect sends a message carrying one schema to one topic. Publications have no synchronous result: you cannot bind a result from executing a publication.
 
 ```yaml
-effects:
-  effect.create_order.publish_created:
+# Directly executed publication
+- kind: execute_effect
+  effect_id: effect.notify.publish_dropped
+  effect:
+    kind: publication
+    topic: topic.notifications
+    schema: schema.NotificationDropped
+    idempotency_key_propagation: []
+  values:
+    kind: deterministic
+    from:
+      - source: input:input.notify.request
+        path: notification_id
+```
+
+```yaml
+# Publication captured as an intent inside a transaction
+- kind: establish_effect_intent
+  bind: intent.create_order.publish_created
+  effect_id: effect.create_order.publish_created
+  effect:
     kind: publication
     topic: topic.order_events
     schema: schema.OrderCreated
@@ -35,6 +58,13 @@ effects:
           components:
             - source: effect:effect.create_order.publish_created
               path: event_id
+  values:
+    kind: deterministic
+    from:
+      - source: input:input.create_order.request
+        path: order_id
+      - source: input:input.create_order.request
+        path: idempotency_key
 ```
 
 <ParamField path="kind" type="string" required>
@@ -50,7 +80,7 @@ effects:
 </ParamField>
 
 <ParamField path="idempotency_key_propagation" type="list[IdempotencyKeyPropagation]" required>
-  Declares that certain values in the published payload carry the same logical idempotency identity as upstream values. This is a lineage assertion — it does not deduplicate publications. See [Idempotency key propagation](#idempotency-key-propagation).
+  Declares that certain values in the published payload carry the same logical idempotency identity as upstream values. This is a lineage assertion, it does not deduplicate publications. See [Idempotency key propagation](#idempotency-key-propagation).
 </ParamField>
 
 ### When a duplicate publication is safe
@@ -58,7 +88,7 @@ effects:
 For an upstream idempotency requirement, a repeated publication is safe only when two conditions both hold:
 
 1. The topic declares a keyed `message_identity` mapping the published schema, and the published instance is class-fixed (replay-deterministic for a direct execution, or available by route A or B for an intent). Every attempt then publishes the **same logical message**.
-2. Every modeled consumer of that message collapses duplicate deliveries — either through a proven idempotency requirement keyed from that subscription, or because the subscription declares `delivery: at_most_once`.
+2. Every modeled consumer of that message collapses duplicate deliveries, either through a proven idempotency requirement keyed from that subscription, or because the subscription declares `delivery: at_most_once`.
 
 A publication declaration alone does not imply exactly-once delivery, atomic commit, deduplication, or that the effect runs at all.
 
@@ -66,11 +96,12 @@ A publication declaration alone does not imply exactly-once delivery, atomic com
 
 ## Request effect
 
-A request effect invokes a specific request input of another operation. It inherits the `Result<Ok, Err>` contract declared on the target input — you do not redeclare the result schema on the effect.
+A request effect invokes a specific request input of another operation. It inherits the `Result<Ok, Err>` contract declared on the target input, you do not redeclare the result schema on the effect.
 
 ```yaml
-effects:
-  effect.notify.send_confirmation:
+- kind: execute_effect
+  effect_id: effect.notify.send_confirmation
+  effect:
     kind: request
     target:
       operation: operation.email_service
@@ -86,6 +117,12 @@ effects:
           components:
             - source: effect:effect.notify.send_confirmation
               path: request_id
+  values:
+    kind: deterministic
+    from:
+      - source: input:input.create_order.request
+        path: order_id
+  bind: result.notify.send_confirmation
 ```
 
 <ParamField path="kind" type="string" required>
@@ -117,18 +154,25 @@ effects:
 
 ### Inherited result contract
 
-A request effect's synchronous result is exactly the `Result<Ok, Err>` declared on the targeted input. You bind it at the execution site:
+A request effect's synchronous result is exactly the `Result<Ok, Err>` declared on the targeted input. Bind it at the execution site with `bind`:
 
 ```yaml
-# In the program:
 - kind: execute_effect
-  effect: effect.notify.send_confirmation
+  effect_id: effect.notify.send_confirmation
+  effect:
+    kind: request
+    target:
+      operation: operation.email_service
+      input: input.email_service.send
+    schema: schema.SendEmailRequest
+    retry: may_repeat
+    idempotency_key_propagation: []
   values:
     kind: deterministic
     from:
       - source: input:input.create_order.request
         path: order_id
-  result: result.notify.send_confirmation   # binds the result for match_result
+  bind: result.notify.send_confirmation   # binds the result for match_result
 ```
 
 ### When a duplicate request is safe
@@ -142,8 +186,9 @@ A duplicate request invocation is safe when the executed instance is class-fixed
 An external effect marks a boundary Conseqa cannot inspect. Because the verifier cannot analyze the external implementation, you must explicitly declare its idempotency behavior and, if applicable, its synchronous result.
 
 ```yaml
-effects:
-  effect.charge_payment.card:
+- kind: execute_effect
+  effect_id: effect.charge_payment.card
+  effect:
     kind: external
     name: payment-provider.charge
     idempotency:
@@ -153,8 +198,15 @@ effects:
       err:
         schema: schema.ChargeDeclined
         disposition: terminal
+  values:
+    kind: unspecified
+  bind: result.charge_payment.card
+```
 
-  effect.notify_published.push:
+```yaml
+- kind: execute_effect
+  effect_id: effect.notify_published.push
+  effect:
     kind: external
     name: push-gateway.notify
     idempotency:
@@ -164,6 +216,11 @@ effects:
           - source: input:input.notify_published.published
             path: event_id
     result: null
+  values:
+    kind: deterministic
+    from:
+      - source: input:input.notify_published.published
+        path: event_id
 ```
 
 <ParamField path="kind" type="string" required>
@@ -207,17 +264,18 @@ A bare schema ID in `err` is shorthand for `disposition: unspecified`.
 
 ## Effect intents
 
-An effect intent is a durable transaction artifact that captures an effect instance for later execution. The intent pattern enables at-least-once execution across failures: the intent is established inside a transaction (so it commits atomically with application state), and executed by a later program step.
+An effect intent is a durable transaction artifact that captures a specific effect instance for later execution. The intent pattern enables at-least-once execution across failures: the effect contract, its concrete values, and the resulting intent binding are all declared at the `establish_effect_intent` transaction step, so the captured instance commits atomically with application state and is recovered from that commit after a crash.
 
 ```yaml
-# Declare the intent on the operation:
-effect_intents:
-  intent.create_order.publish_created:
-    effect: effect.create_order.publish_created
-
-# Establish it inside a transaction step:
+# Inside a transaction's steps: capture the intent
 - kind: establish_effect_intent
-  intent: intent.create_order.publish_created
+  bind: intent.create_order.publish_created
+  effect_id: effect.create_order.publish_created
+  effect:
+    kind: publication
+    topic: topic.order_events
+    schema: schema.OrderCreated
+    idempotency_key_propagation: []
   values:
     kind: deterministic
     from:
@@ -225,23 +283,58 @@ effect_intents:
         path: order_id
       - source: input:input.create_order.request
         path: idempotency_key
+```
 
-# Execute it in a later program step:
+```yaml
+# Later in the operation's program: execute the captured instance
 - kind: execute_effect_intent
   intent: intent.create_order.publish_created
 ```
 
-<ParamField path="effect" type="Id" required>
-  The effect this intent will execute. Must be declared in the operation's `effects` map.
+<ParamField path="bind" type="Id" required>
+  The operation-local intent binding this transaction step establishes. Later program steps refer to this exact name in `execute_effect_intent`.
 </ParamField>
 
-Establishing an intent constructs one logical instance of its effect — values are fixed at establishment, not at execution. `execute_effect_intent` runs that fixed instance and does not recompute the values.
+<ParamField path="effect_id" type="Id" required>
+  Stable identifier for this inline effect site. `ValueSource::Effect(effect_id)` (used in idempotency-key propagation and value lineage) resolves to this site.
+</ParamField>
+
+<ParamField path="effect" type="Effect" required>
+  The inline effect contract this intent captures. May be a publication or request; external effects with side effects that must be captured atomically follow the same shape.
+</ParamField>
+
+<ParamField path="values" type="Derivation" required>
+  Provenance of the concrete effect instance captured by this intent. The values are fixed at establishment.
+</ParamField>
+
+Establishing an intent atomically declares the effect contract, constructs one concrete instance from `values`, and establishes that captured instance as the bound artifact. `execute_effect_intent` runs the exact captured instance and does not recompute the values.
 
 <Tip>
   An intent declaration does not imply an automatic background executor. The intent executes only when a program step explicitly runs it via `execute_effect_intent`. Retry availability depends on whether the establishing transaction uses natural replay (route A) or an explicit `deduplicated_by` commit (route B).
 </Tip>
 
-Reconstructing or recovering the same intent does not prove that repeating the underlying external effect is safe. A crash after an external effect succeeds but before its completion is durably known may lead to another effect attempt — the effect's own idempotency guarantee handles that uncertainty.
+Reconstructing or recovering the same intent does not prove that repeating the underlying external effect is safe. A crash after an external effect succeeds but before its completion is durably known may lead to another effect attempt, the effect's own idempotency guarantee handles that uncertainty.
+
+### Transition-owned intents
+
+State-machine transitions declare their own side-effect contracts. When a transaction applies a transition, the transition step's `effect_intents` map binds each of the transition's side effects into an operation-local intent artifact:
+
+```yaml
+- kind: transition
+  machine: machine.order_lifecycle
+  transition: transition.order.mark_paid
+  subject: ...
+  effect_intents:
+    effect.order.paid:
+      bind: intent.apply_payment.order_paid
+      values:
+        kind: deterministic
+        from:
+          - source: input:input.apply_payment.captured
+            path: order_id
+```
+
+The map key is the state-machine transition side-effect ID, coverage must be exact. Each entry supplies exactly one derivation and one intent binding. Later program steps execute the intent by binding name via `execute_effect_intent`.
 
 ---
 
@@ -261,7 +354,7 @@ idempotency_key_propagation:
           path: event_id
 ```
 
-The `source` components identify the upstream key fields; the `target` components identify the corresponding fields in the outbound payload. Propagation does **not** deduplicate anything — it tells the verifier that a consumer observing the target fields is observing the same logical key as the producer's source fields.
+The `source` components identify the upstream key fields; the `target` components identify the corresponding fields in the outbound payload. The `effect:<effect_id>` reference resolves to the inline effect site that carries the outbound payload. Propagation does **not** deduplicate anything, it tells the verifier that a consumer observing the target fields is observing the same logical key as the producer's source fields.
 
 <Note>
   Propagation plays no role in the publication duplicate-safety discharge. A class-fixed publication instance already makes every duplicate payload-equal, so a consumer's key evaluates the same across all duplicates regardless of whether propagation was declared.
@@ -269,12 +362,34 @@ The `source` components identify the upstream key fields; the `target` component
 
 ---
 
+## Result bindings on effect execution
+
+Both `execute_effect` and `execute_effect_intent` accept an optional `bind` field naming the effect result observation:
+
+```yaml
+- kind: execute_effect
+  effect_id: effect.charge_payment.card
+  effect: ...
+  values: ...
+  bind: result.charge_payment.card
+```
+
+```yaml
+- kind: execute_effect_intent
+  intent: intent.transcode_video.completed
+  bind: result.transcode_video.completed
+```
+
+The binding is valid only when the underlying effect contract is result-bearing (request effects, and external effects with a declared `result`). Publications have no result and must not declare `bind`. Effect result bindings are attempt-local observations, not transaction artifacts.
+
+---
+
 ## Summary of effect kinds
 
 | Kind | Has synchronous result? | Idempotency declared how? |
 |---|---|---|
-| `publication` | No — cannot bind a result | Via topic `message_identity` + consumer requirements |
-| `request` | Yes — inherits from target input | Via target operation's idempotency requirement |
+| `publication` | No, cannot bind a result | Via topic `message_identity` + consumer requirements |
+| `request` | Yes, inherits from target input | Via target operation's idempotency requirement |
 | `external` | Optional (`result:` or `null`) | Explicitly: `unspecified`, `not_deduplicated`, or `deduplicated_by` |
 
 <CardGroup cols={2}>

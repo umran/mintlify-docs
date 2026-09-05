@@ -1,22 +1,51 @@
 ---
 title: "Conseqa Operation Program: All Steps and Control Flow"
 sidebarTitle: "Program Control"
-description: "Reference for the operation program field: all step kinds, decision steps, terminal steps, step location notation, and decision replay analysis."
+description: "Reference for the operation program field: inline transactions and effects, all step kinds, decision steps, terminal steps, step location notation, and decision replay analysis."
 ---
 
-The `program` field of an operation defines its explicit control flow as an ordered block of steps. Every step in the program describes a causal action — running a transaction, executing an effect, making a decision — and every reachable path through the program ends at an explicit terminal. There are no loops; the program structure is acyclic by construction.
+The `program` field of an operation defines its explicit control flow as an ordered block of steps. Every step in the program describes a causal action, running an inline transaction, executing an inline effect, making a decision, and every reachable path through the program ends at an explicit terminal. There are no loops; the program structure is acyclic by construction.
 
-A retry traverses the same declared control from the first step. What the retry re-encounters at each transaction or effect step is judged by the replay and idempotency rules the verifier applies to that step.
+Transactions and direct effect contracts live inside the program at the step that executes them. There is no operation-level registry to reference back into. A retry traverses the same declared control from the first step. What the retry re-encounters at each transaction or effect step is judged by the replay and idempotency rules the verifier applies to that step.
 
 ## Program structure
 
-The program is a nested block of `OperationStep` values. Decision steps — `match_result` and `branch` — each open two sub-blocks (arms), and the verifier analyzes every path through the complete tree.
+The program is a nested block of `OperationStep` values. Decision steps, `match_result` and `branch`, each open two sub-blocks (arms), and the verifier analyzes every path through the complete tree.
 
 ```yaml
 program:
   steps:
     - kind: transaction
-      transaction: tx.create_order.new
+      id: tx.create_order.new
+      data_model: data.checkout
+      isolation: read_committed
+      idempotency:
+        kind: deduplicated_by
+        key:
+          components:
+            - source: input:input.create_order.request
+              path: idempotency_key
+      steps:
+        - kind: insert
+          object: object.order
+          values:
+            kind: deterministic
+            from:
+              - source: input:input.create_order.request
+                path: order_id
+        - kind: establish_effect_intent
+          bind: intent.create_order.publish_created
+          effect_id: effect.create_order.publish_created
+          effect:
+            kind: publication
+            topic: topic.order_events
+            schema: schema.OrderCreated
+            idempotency_key_propagation: []
+          values:
+            kind: deterministic
+            from:
+              - source: input:input.create_order.request
+                path: order_id
     - kind: execute_effect_intent
       intent: intent.create_order.publish_created
     - kind: return
@@ -26,10 +55,8 @@ program:
         values:
           kind: deterministic
           from:
-            - source: transaction_output:output.create_order
+            - source: input:input.create_order.request
               path: order_id
-            - source: transaction_output:output.create_order
-              path: status
 ```
 
 ---
@@ -38,28 +65,70 @@ program:
 
 ### `transaction`
 
-Executes, or resolves the prior keyed commit of, an operation-owned transaction.
+Declares and executes one inline atomic transaction at this point in the program. On re-encounter with a keyed commit, resolves the prior `Commit(operation, T.id, K)` and restores its artifacts instead of executing the body again.
 
 ```yaml
 - kind: transaction
-  transaction: tx.create_order.new
+  id: tx.create_order.new
+  data_model: data.checkout
+  isolation: read_committed
+  idempotency:
+    kind: deduplicated_by
+    key:
+      components:
+        - source: input:input.create_order.request
+          path: idempotency_key
+  steps:
+    - kind: insert
+      object: object.order
+      values: ...
 ```
 
-For a transaction with `idempotency: { kind: deduplicated_by, key: ... }`, if a prior `Commit(T,K)` exists for the same evaluated key, this step resolves that commit and restores all artifacts it retained — transaction outputs and effect intents — without executing the transaction body again. For a transaction without a keyed commit, the body executes.
-
-<ParamField path="transaction" type="Id" required>
-  The ID of the transaction to run. Must be declared in the operation's `transactions` map.
+<ParamField path="id" type="Id" required>
+  Stable logical ID for this inline transaction. Identifies the inline declaration itself (used for keyed commit identity, diagnostics, and proof evidence). Must be unique across all inline transactions in the operation.
 </ParamField>
+
+<ParamField path="data_model" type="Id | null" required>
+  The transactional state boundary. `null` only when the transaction performs no application object access and exists solely to produce framework artifacts.
+</ParamField>
+
+<ParamField path="isolation" type="string" required>
+  The isolation guarantee: `unspecified`, `read_committed`, `snapshot`, or `serializable`.
+</ParamField>
+
+<ParamField path="idempotency" type="object" required>
+  Keyed commit deduplication contract: `unspecified`, `not_deduplicated`, or `deduplicated_by { key }`.
+</ParamField>
+
+<ParamField path="steps" type="list[TransactionStep]" required>
+  Ordered transaction body (reads, writes, inserts, deletes, locks, transitions, effect-intent establishments, transaction-output establishments). See [Transactions](/concepts/transactions).
+</ParamField>
+
+For a transaction with `idempotency: { kind: deduplicated_by, key: ... }`, if a prior commit exists for the same evaluated key, this step resolves that commit and restores all artifacts it retained, transaction outputs and effect intents, without executing the transaction body again. For a transaction without a keyed commit, the body executes.
 
 ---
 
 ### `execute_effect`
 
-Constructs one instance of an operation-owned effect and executes it directly.
+Declares one inline effect contract and executes it directly at this point in the program.
 
 ```yaml
 - kind: execute_effect
-  effect: effect.transcode_video.engine
+  effect_id: effect.transcode_video.engine
+  effect:
+    kind: external
+    name: transcoding-engine.render
+    idempotency:
+      kind: deduplicated_by
+      key:
+        components:
+          - source: input:input.transcode_video.uploaded
+            path: video_id
+    result:
+      ok: schema.RenderCompleted
+      err:
+        schema: schema.RenderFailed
+        disposition: terminal
   values:
     kind: deterministic
     from:
@@ -67,22 +136,26 @@ Constructs one instance of an operation-owned effect and executes it directly.
         path: video_id
       - source: input:input.transcode_video.uploaded
         path: source_uri
-  result: result.transcode_video.render
+  bind: result.transcode_video.render
 ```
 
-<ParamField path="effect" type="Id" required>
-  The ID of the effect to execute. Must be declared in the operation's `effects` map.
+<ParamField path="effect_id" type="Id" required>
+  Stable identifier for this inline effect site. Used as `ValueSource::Effect(effect_id)` in idempotency-key propagation and other value lineage. Must be unique across inline operation-owned effect sites within the operation.
+</ParamField>
+
+<ParamField path="effect" type="Effect" required>
+  The inline effect contract: a publication, request, or external effect declared in full at this site. See [Effects](/dsl/effects).
 </ParamField>
 
 <ParamField path="values" type="Derivation" required>
   Declares the provenance of the complete outgoing effect payload. Either `kind: unspecified` (unknown provenance, declared explicitly) or `kind: deterministic` with a `from` list of value references. See [Value References](/dsl/value-references).
 </ParamField>
 
-<ParamField path="result" type="Id">
-  Binds the effect's synchronous result under this ID. Only valid for result-bearing effects (request and external effects with a declared `result`). Publications have no result and must not declare one. Omit when you deliberately ignore the result.
+<ParamField path="bind" type="Id">
+  Binds the effect's synchronous result observation under this name. Only valid for result-bearing effects (request and external effects with a declared `result`). Publications have no result and must not declare `bind`. Omit when you deliberately ignore the result.
 </ParamField>
 
-The derivation is evaluated in the operation-level value context. It may not reference `transaction_read` results, which are local to the transaction that produced them.
+Both the effect-contract value roots and the `values` derivation are evaluated in the operation-level value context immediately before this step. They may not reference `transaction_read` bindings, which are local to the transaction that produced them.
 
 ---
 
@@ -99,14 +172,14 @@ Executes an already-established effect intent. The values were fixed when the in
 # With an optional result binding (for a request or external intent):
 - kind: execute_effect_intent
   intent: intent.transcode_video.completed
-  result: result.transcode_video.completed
+  bind: result.transcode_video.completed
 ```
 
 <ParamField path="intent" type="Id" required>
-  The ID of the effect intent to execute. Must be declared in the operation's `effect_intents` map and be definitely available at this program point — established or recovered on every path reaching here.
+  The intent binding to execute. Must have been established by an `establish_effect_intent` or by a `transition` step's `effect_intents` map on every path reaching this step (definite availability).
 </ParamField>
 
-<ParamField path="result" type="Id">
+<ParamField path="bind" type="Id">
   Optional result binding, following the same rules as for `execute_effect`.
 </ParamField>
 
@@ -122,14 +195,22 @@ Destructures a bound effect result into its `ok` and `err` arms. Use this step t
   ok:
     steps:
       - kind: transaction
-        transaction: tx.transcode_video.complete
+        id: tx.transcode_video.complete
+        data_model: data.videos
+        isolation: read_committed
+        idempotency: { kind: unspecified }
+        steps: [...]
       - kind: execute_effect_intent
         intent: intent.transcode_video.completed
       - kind: complete
   err:
     steps:
       - kind: transaction
-        transaction: tx.transcode_video.fail
+        id: tx.transcode_video.fail
+        data_model: data.videos
+        isolation: read_committed
+        idempotency: { kind: unspecified }
+        steps: [...]
       - kind: complete
 ```
 
@@ -168,7 +249,12 @@ An ordinary control decision over modeled values. Executes the `then` block when
   then:
     steps:
       - kind: execute_effect
-        effect: effect.checkout.apply_ca_tax
+        effect_id: effect.checkout.apply_ca_tax
+        effect:
+          kind: external
+          name: tax-service.apply
+          idempotency: { kind: unspecified }
+          result: null
         values:
           kind: unspecified
       - kind: complete
@@ -178,7 +264,7 @@ An ordinary control decision over modeled values. Executes the `then` block when
 ```
 
 <ParamField path="condition" type="Condition" required>
-  The predicate to evaluate. One of four forms — see [Conditions](#conditions) below.
+  The predicate to evaluate. One of four forms, see [Conditions](#conditions) below.
 </ParamField>
 
 <ParamField path="then" type="OperationBlock" required>
@@ -186,7 +272,7 @@ An ordinary control decision over modeled values. Executes the `then` block when
 </ParamField>
 
 <ParamField path="otherwise" type="OperationBlock">
-  The block to execute when the condition does not hold. If absent, the branch falls through to the following step. A `branch` without `otherwise` does not terminate its path — the validation rule requires every reachable path to end at a terminal.
+  The block to execute when the condition does not hold. If absent, the branch falls through to the following step. A `branch` without `otherwise` does not terminate its path, the validation rule requires every reachable path to end at a terminal.
 </ParamField>
 
 #### Conditions
@@ -198,7 +284,7 @@ An ordinary control decision over modeled values. Executes the `then` block when
 | `and` | All nested conditions hold. | Yes, if every nested condition is |
 | `not` | The nested condition does not hold. | Yes, if the nested condition is |
 
-`eq`, `and`, and `not` are deterministic functions of their references. `unspecified` is never deterministic. A condition is deterministic only when every component is — a single `unspecified` anywhere in an `and` or `not` makes the whole condition unspecified.
+`eq`, `and`, and `not` are deterministic functions of their references. `unspecified` is never deterministic. A condition is deterministic only when every component is, a single `unspecified` anywhere in an `and` or `not` makes the whole condition unspecified.
 
 For `eq`, the `equals` field accepts either a plain scalar literal or a value reference map:
 
@@ -284,16 +370,19 @@ The verifier enforces these structural rules before any replay analysis:
 
 1. **Every reachable path ends at a terminal.** A `return` or `complete` must be reachable from every branch. A `branch` without `otherwise` is not a valid terminal for its path.
 2. **No step follows a terminal.** Steps after `return` or `complete` in the same block are unreachable and reported as errors.
-3. **Transaction artifacts are definitely available.** A transaction output or effect intent may only be consumed at a program point where a transaction on **every** path reaching that point has established or recovered it.
-4. **Result bindings are definitely assigned.** A result binding may only be matched or referenced where an effect-executing step has bound it on every path reaching that point.
+3. **IDs are unique within the operation.** Duplicate `Transaction.id`, duplicate inline `effect_id`, and duplicate binding IDs are rejected.
+4. **Bindings have exactly one producer and are definitely available at every consumer.** A transaction output, an effect intent, or an effect result may only be consumed at a program point where a producer has bound it on **every** falling-through path reaching that point.
+5. **Transaction reads never leave their transaction.** A `transaction_read` binding is visible only inside the transaction that produced it.
 5. **Variant scope is respected.** `effect_result_ok:<r>` is valid only inside the `ok` arm of a `match_result` on `r`; `effect_result_err:<r>` only inside the `err` arm.
 6. **Return targets request inputs.** `return.request` must name a `kind: request` input of the operation.
+
+Bindings do not forward-reference: a binding is unavailable before its producer step. The validator reports a use-before-bind error rather than resolving an operation-wide declaration and hoping control eventually produces the value.
 
 ---
 
 ## Step location notation
 
-Steps carry no IDs. Diagnostics, proofs, and the visualizer identify steps by their **location**: a dot-separated sequence of one-based positions and arm names.
+Steps carry no location IDs of their own. Diagnostics, proofs, and the visualizer identify steps by their **location**: a dot-separated sequence of one-based positions and arm names.
 
 | Location | Meaning |
 |---|---|
@@ -302,34 +391,57 @@ Steps carry no IDs. Diagnostics, proofs, and the visualizer identify steps by th
 | `2.then.1` | The first step of the `then` arm of the second top-level step (a `branch`) |
 | `4.err.2` | The second step of the `err` arm of the fourth top-level step |
 
-When a proof or an obstacle is reported at a location, the same location notation appears in the JSON report's `evidence` and `summary` fields and in the visualization.
+When a proof or an obstacle is reported at a location, the same location notation appears in the JSON report's `evidence` and `summary` fields and in the visualization. `StepLocation` names the site's position in the program; keyed commit identity for a transaction is anchored on its `id`, not on `StepLocation`.
 
 ---
 
 ## Decision replay
 
-When the verifier analyzes idempotency or result-replay requirements, it must establish that every decision on the path **replays** — that every attempt in the same logical class takes the same arm. A decision replays when:
+When the verifier analyzes idempotency or result-replay requirements, it must establish that every decision on the path **replays**, that every attempt in the same logical class takes the same arm. A decision replays when:
 
 - for `branch`: the condition is deterministic (no `unspecified` anywhere) **and** every value reference it observes is replay-stable, or
 - for `match_result`: the matched result is replay-stable.
 
-If a decision cannot be established to replay, the verifier reports it as an obstacle. This means a retry might take a different arm, doing different work on repeated attempts. It is not proof that the decision is wrong — it is an honest gap in the model's declared facts.
+If a decision cannot be established to replay, the verifier reports it as an obstacle. This means a retry might take a different arm, doing different work on repeated attempts. It is not proof that the decision is wrong, it is an honest gap in the model's declared facts.
 
 ---
 
 ## Complete example: transcode operation
 
-The following program from the video streaming fixture shows both a `match_result` decision and three transactions used across the two arms:
+The following program from the video streaming fixture shows a `match_result` decision and three inline transactions used across the two arms:
 
 ```yaml
 program:
   steps:
     # Step 1: claim the transcode job transactionally
     - kind: transaction
-      transaction: tx.transcode_video.claim
+      id: tx.transcode_video.claim
+      data_model: data.videos
+      isolation: read_committed
+      idempotency:
+        kind: deduplicated_by
+        key:
+          components:
+            - source: input:input.transcode_video.uploaded
+              path: event_id
+      steps: [...]
     # Step 2: call the transcoding engine; bind the result
     - kind: execute_effect
-      effect: effect.transcode_video.engine
+      effect_id: effect.transcode_video.engine
+      effect:
+        kind: external
+        name: transcoding-engine.render
+        idempotency:
+          kind: deduplicated_by
+          key:
+            components:
+              - source: input:input.transcode_video.uploaded
+                path: video_id
+        result:
+          ok: schema.RenderCompleted
+          err:
+            schema: schema.RenderFailed
+            disposition: terminal
       values:
         kind: deterministic
         from:
@@ -337,7 +449,7 @@ program:
             path: video_id
           - source: input:input.transcode_video.uploaded
             path: source_uri
-      result: result.transcode_video.render
+      bind: result.transcode_video.render
     # Step 3: branch on the engine's result
     - kind: match_result
       result: result.transcode_video.render
@@ -345,7 +457,11 @@ program:
         steps:
           # Step 3.ok.1 — record the manifest
           - kind: transaction
-            transaction: tx.transcode_video.complete
+            id: tx.transcode_video.complete
+            data_model: data.videos
+            isolation: read_committed
+            idempotency: { kind: unspecified }
+            steps: [...]
           # Step 3.ok.2 — announce completion
           - kind: execute_effect_intent
             intent: intent.transcode_video.completed
@@ -355,14 +471,18 @@ program:
         steps:
           # Step 3.err.1 — mark the job failed
           - kind: transaction
-            transaction: tx.transcode_video.fail
+            id: tx.transcode_video.fail
+            data_model: data.videos
+            isolation: read_committed
+            idempotency: { kind: unspecified }
+            steps: [...]
           # Step 3.err.2
           - kind: complete
 ```
 
 <CardGroup cols={2}>
   <Card title="Effects" icon="arrow-right-arrow-left" href="/dsl/effects">
-    How to declare the effects that program steps execute
+    How to declare inline effect contracts at execution and establishment sites
   </Card>
   <Card title="Value References" icon="link" href="/dsl/value-references">
     How to write values derivations and condition roots in program steps

@@ -1,44 +1,51 @@
 ---
 title: "Transactions and Atomic Execution in Conseqa Models"
 sidebarTitle: "Transactions"
-description: "Transactions are atomic units inside operations. Learn isolation levels, step kinds, derivation, and how outputs and intents flow into program control."
+description: "Transactions are inline atomic units inside operation programs. Learn isolation levels, step kinds, typed bindings, and how outputs and intents flow into program control."
 ---
 
-A transaction is one atomic commit-or-abort unit inside an operation's program. When a program step executes a transaction, all of its steps commit together or not at all. Transactions are the boundary through which the verifier reasons about isolation, deduplication, and artifact production. Declaring a transaction inside an operation does not execute it — execution happens only when a program step references it.
+A transaction is one atomic commit-or-abort unit declared inline in an operation's program. When execution reaches a `transaction` step, all of its steps commit together or not at all. Transactions are the boundary through which the verifier reasons about isolation, deduplication, and artifact production.
+
+Transactions are not predeclared in an operation-level registry: they live at the exact program site that executes them. Each inline transaction carries a stable `id` that identifies the transaction itself for keyed commit recovery, diagnostics, and proof evidence.
 
 ## Transaction fields
 
-Every transaction declares the following:
+Every inline transaction declares the following:
 
 | Field | Purpose |
 |---|---|
+| `id` | Stable logical ID for this inline transaction (used for keyed commit identity) |
 | `data_model` | The logical transactional state boundary this transaction operates against |
 | `isolation` | The isolation level provided by the execution environment |
 | `idempotency` | Whether the environment provides keyed commit deduplication |
 | `steps` | The ordered sequence of logical operations inside the transaction |
 
 ```yaml
-transactions:
-  tx.create_order.new:
-    data_model: data.checkout
-    isolation: read_committed
-    idempotency:
-      kind: deduplicated_by
-      key:
-        components:
+- kind: transaction
+  id: tx.create_order.new
+  data_model: data.checkout
+  isolation: read_committed
+  idempotency:
+    kind: deduplicated_by
+    key:
+      components:
+        - source: input:input.create_order.request
+          path: idempotency_key
+  steps:
+    - kind: insert
+      object: object.order
+      values:
+        kind: deterministic
+        from:
           - source: input:input.create_order.request
-            path: idempotency_key
-    steps:
-      - kind: insert
-        object: object.order
-        values:
-          kind: deterministic
-          from:
-            - source: input:input.create_order.request
-              path: order_id
-            - source: input:input.create_order.request
-              path: amount
+            path: order_id
+          - source: input:input.create_order.request
+            path: amount
 ```
+
+### `id`
+
+`id` is a stable logical identifier for the inline transaction. It is not a lookup into another declaration. Durable commit identity for keyed deduplication is anchored on `id`, so moving the inline transaction inside the program does not silently change its identity. Two program sites that execute distinct transactions must declare two inline transactions with distinct `id` values.
 
 ### `data_model`
 
@@ -67,20 +74,20 @@ The `idempotency` field declares whether the execution environment provides dura
 |---|---|
 | `unspecified` | No explicit deduplication fact; the verifier may still prove natural replayability |
 | `not_deduplicated` | Explicitly declares no keyed deduplication; natural replayability still provable |
-| `deduplicated_by { key }` | The environment guarantees `Commit(T,K)` semantics for this key |
+| `deduplicated_by { key }` | The environment guarantees `Commit(operation, T.id, K)` semantics for this key |
 
-**`deduplicated_by`** is the key mechanism for safe retries. When the execution environment sees the same `(transaction, key)` pair again, it resolves the prior commit and restores any artifacts that committed with it — rather than running the transaction body again. This makes the transaction safe across retries and lets the verifier prove that artifacts produced by the first commit are available on every subsequent attempt.
+**`deduplicated_by`** is the key mechanism for safe retries. When the execution environment sees the same `(operation, T.id, key)` triple again, it resolves the prior commit and restores any artifacts that committed with it, rather than running the transaction body again. This makes the transaction safe across retries and lets the verifier prove that artifacts produced by the first commit are available on every subsequent attempt.
 
 ## Transaction step kinds
 
 Steps are declared as an ordered list inside `steps`. The step order represents logical program order, which matters for lock-order analysis, transaction-read provenance, and artifact availability.
 
 <Accordion title="read">
-Reads fields from one or more objects matching a selector and binds the result to a transaction-local ID.
+Reads fields from one or more objects matching a selector and produces a transaction-local **read binding**. The binding name lives under `bind` and is referenced by later steps in the same transaction as `transaction_read:<bind>`.
 
 ```yaml
 - kind: read
-  result: read.reserve_inventory.stock
+  bind: read.reserve_inventory.stock
   target:
     object: object.stock
     predicate:
@@ -103,7 +110,7 @@ Reads fields from one or more objects matching a selector and binds the result t
       - reserved
 ```
 
-`fields` accepts `kind: all` to read every field, or `kind: only` with a list. The result is accessible within the same transaction through `transaction_read:<result-id>` value references. It is **not** available outside the transaction — export it through an `establish_transaction_output` step to use it in later program steps.
+`fields` accepts `kind: all` to read every field, or `kind: only` with a list. The binding is visible only inside the same transaction. It is **not** exported to later program steps and cannot become a transaction artifact. To use a read result in later program control, export it through an `establish_transaction_output` step.
 </Accordion>
 
 <Accordion title="write">
@@ -185,30 +192,53 @@ Lock steps appear in program order; concurrent transactions attempting to acquir
 </Accordion>
 
 <Accordion title="transition">
-Applies a state machine transition to a persistent object. See [State Machines](/concepts/state-machines) for full details. A transition step also declares `effect_values` — one value derivation per side effect declared on the transition.
+Applies a state machine transition to a persistent object. See [State Machines](/concepts/state-machines) for full details. The transition step provides an `effect_intents` map with one entry per side effect declared on the transition. Each entry supplies the concrete `values` derivation for that side effect and an operation-local `bind` name for the resulting intent artifact.
 
 ```yaml
 - kind: transition
   machine: machine.order_lifecycle
-  transition: transition.order.cancel
+  transition: transition.order.mark_paid
   subject:
     object: object.order
     predicate:
       kind: eq
       field: order_id
       value:
-        source: input:input.cancel_order.request
+        source: input:input.apply_payment.captured
         path: order_id
-  effect_values: {}
+  effect_intents:
+    effect.order.paid:
+      bind: intent.apply_payment.order_paid
+      values:
+        kind: deterministic
+        from:
+          - source: input:input.apply_payment.captured
+            path: order_id
 ```
+
+The map's key is the side-effect ID declared on the state-machine transition. Coverage must be exact: every side effect on the transition receives exactly one derivation and one intent binding.
 </Accordion>
 
 <Accordion title="establish_effect_intent">
-Establishes an effect intent artifact atomically with the transaction commit. The intent captures the specific effect instance — its payload values, fixed by the `values` derivation at this step — so the intent is recoverable after a crash without re-deriving the payload.
+Declares an effect contract inline, constructs one concrete instance of it from `values`, and atomically establishes that captured instance as an **effect intent binding** identified by `bind`. `effect_id` names the inline effect site itself (used by `ValueSource::Effect` and diagnostics).
 
 ```yaml
 - kind: establish_effect_intent
-  intent: intent.create_order.publish_created
+  bind: intent.create_order.publish_created
+  effect_id: effect.create_order.publish_created
+  effect:
+    kind: publication
+    topic: topic.order_events
+    schema: schema.OrderCreated
+    idempotency_key_propagation:
+      - source:
+          components:
+            - source: input:input.create_order.request
+              path: idempotency_key
+        target:
+          components:
+            - source: effect:effect.create_order.publish_created
+              path: event_id
   values:
     kind: deterministic
     from:
@@ -216,23 +246,26 @@ Establishes an effect intent artifact atomically with the transaction commit. Th
         path: order_id
       - source: input:input.create_order.request
         path: idempotency_key
-      - source: input:input.create_order.request
-        path: warehouse_id
 ```
+
+A later `execute_effect_intent` step consumes the binding by name and executes the exact captured instance without recomputing its values.
 </Accordion>
 
 <Accordion title="establish_transaction_output">
-Exports a typed value from the transaction into the enclosing operation's control. The output is available to program steps after the transaction executes or recovers.
+Exports a typed value from the transaction into the enclosing operation's control. The binder declares the output's `bind` name, its `schema`, and its `values` derivation at the production site, all in one place.
 
 ```yaml
 - kind: establish_transaction_output
-  output: output.create_order
+  bind: output.create_order
+  schema: schema.CreateOrderResponse
   values:
     kind: deterministic
     from:
       - source: input:input.create_order.request
         path: order_id
 ```
+
+Program steps after the transaction reference the artifact as `transaction_output:<bind>`.
 </Accordion>
 
 ## Object selectors
@@ -270,21 +303,21 @@ values:
 
 ## Transaction outputs and operation control flow
 
-Information observed inside a transaction (through a `read` step) is transaction-local and does not escape automatically. To use a read result in later program steps — a branch condition, an effect derivation, a terminal result — you must export it explicitly through `establish_transaction_output`.
+Information observed inside a transaction (through a `read` step) is transaction-local and does not escape automatically. To use a read result in later program steps, a branch condition, an effect derivation, a terminal result, you must export it explicitly through `establish_transaction_output`.
 
 ```text
-transaction-local read result
+transaction-local read binding
          |
-         | establish_transaction_output
+         | establish_transaction_output { bind, schema, values }
          v
-operation-visible transaction output
+operation-visible transaction output binding
          |
-         | program steps can now reference it
+         | program steps reference it as transaction_output:<bind>
          v
 effect derivation, branch condition, return outcome
 ```
 
-A transaction output does not imply a database row, a response, or idempotency. Establishing an output does not prevent the transaction from executing again — only `deduplicated_by` prevents that.
+A transaction output does not imply a database row, a response, or idempotency. Establishing an output does not prevent the transaction from executing again, only `deduplicated_by` prevents that.
 
 ## Artifact replay
 
@@ -292,8 +325,8 @@ When a crash occurs between a transaction commit and a later program step that d
 
 **Route A — Reconstruction:** the establishing transaction is naturally replayable, and the artifact's derivation is replay-deterministic. A retry re-executes the transaction and reconstructs the same artifact without requiring it to have been separately stored.
 
-**Route B — Recovery:** the establishing transaction is `deduplicated_by { key }` with a replay-stable key. A retry encounters the prior `Commit(T,K)`, resolves it, and restores the exact artifacts from the first successful commit.
+**Route B — Recovery:** the establishing transaction is `deduplicated_by { key }` with a replay-stable key. A retry encounters the prior `Commit(operation, T.id, K)`, resolves it, and restores the exact artifacts from the first successful commit.
 
 <Tip>
-Use `deduplicated_by` on any transaction that establishes artifacts consumed by later program steps when those artifacts cannot be deterministically reconstructed (for example, when they depend on a `transaction_read` result, which cannot prove natural replayability in V1).
+Use `deduplicated_by` on any transaction that establishes artifacts consumed by later program steps when those artifacts cannot be deterministically reconstructed (for example, when they depend on a `transaction_read` binding, which cannot prove natural replayability in V1).
 </Tip>

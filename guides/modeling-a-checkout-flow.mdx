@@ -164,66 +164,59 @@ operations:
         result:
           ok: schema.CreateOrderResponse
           err: schema.RequestRejected
-    effects:
-      effect.create_order.publish_created:
-        kind: publication
-        topic: topic.order_events
-        schema: schema.OrderCreated
-        idempotency_key_propagation:
-          - source:
-              components:
-                - source: input:input.create_order.request
-                  path: idempotency_key
-            target:
-              components:
-                - source: effect:effect.create_order.publish_created
-                  path: event_id
-    effect_intents:
-      intent.create_order.publish_created:
-        effect: effect.create_order.publish_created
-    transaction_outputs:
-      output.create_order:
-        schema: schema.CreateOrderResponse
-    transactions:
-      tx.create_order.new:
-        data_model: data.checkout
-        isolation: read_committed
-        idempotency:
-          kind: deduplicated_by
-          key:
-            components:
-              - source: input:input.create_order.request
-                path: idempotency_key
-        steps:
-          - kind: insert
-            object: object.order
-            values:
-              kind: deterministic
-              from:
-                - source: input:input.create_order.request
-                  path: order_id
-                - source: input:input.create_order.request
-                  path: amount
-          - kind: establish_effect_intent
-            intent: intent.create_order.publish_created
-            values:
-              kind: deterministic
-              from:
-                - source: input:input.create_order.request
-                  path: order_id
-                - source: input:input.create_order.request
-                  path: idempotency_key
-          - kind: establish_transaction_output
-            output: output.create_order
-            values:
-              kind: deterministic
-              from:
-                - source: input:input.create_order.request
-                  path: order_id
     program:
       steps:
         - kind: transaction
-          transaction: tx.create_order.new
+          id: tx.create_order.new
+          data_model: data.checkout
+          isolation: read_committed
+          idempotency:
+            kind: deduplicated_by
+            key:
+              components:
+                - source: input:input.create_order.request
+                  path: idempotency_key
+          steps:
+            - kind: insert
+              object: object.order
+              values:
+                kind: deterministic
+                from:
+                  - source: input:input.create_order.request
+                    path: order_id
+                  - source: input:input.create_order.request
+                    path: amount
+            - kind: establish_effect_intent
+              bind: intent.create_order.publish_created
+              effect_id: effect.create_order.publish_created
+              effect:
+                kind: publication
+                topic: topic.order_events
+                schema: schema.OrderCreated
+                idempotency_key_propagation:
+                  - source:
+                      components:
+                        - source: input:input.create_order.request
+                          path: idempotency_key
+                    target:
+                      components:
+                        - source: effect:effect.create_order.publish_created
+                          path: event_id
+              values:
+                kind: deterministic
+                from:
+                  - source: input:input.create_order.request
+                    path: order_id
+                  - source: input:input.create_order.request
+                    path: idempotency_key
+            - kind: establish_transaction_output
+              bind: output.create_order
+              schema: schema.CreateOrderResponse
+              values:
+                kind: deterministic
+                from:
+                  - source: input:input.create_order.request
+                    path: order_id
         - kind: execute_effect_intent
           intent: intent.create_order.publish_created
         - kind: return
@@ -255,8 +248,8 @@ operations:
 Several things are working together here:
 
 - `tx.create_order.new` is `deduplicated_by` the request's `idempotency_key`. This means a second attempt under the same key resolves the prior commit instead of inserting a duplicate order and re-establishing the intent.
-- The `effect_intent` captures the publication payload atomically with the transaction commit. Even if the process crashes between the commit and the publication step, a retry recovers the intent from the keyed commit and executes it.
-- `idempotency_key_propagation` on the publication effect declares that the downstream `event_id` carries the same logical identity as the upstream `idempotency_key`. This lineage is what lets the verifier trace the idempotency class from `create_order` through to `reserve_inventory`.
+- The `establish_effect_intent` step declares the publication contract inline, captures its concrete payload from `values`, and binds it as `intent.create_order.publish_created`, all atomically with the transaction commit. Even if the process crashes between the commit and the publication step, a retry recovers the intent from the keyed commit and executes it.
+- `idempotency_key_propagation` on the inline publication effect declares that the downstream `event_id` carries the same logical identity as the upstream `idempotency_key`. This lineage is what lets the verifier trace the idempotency class from `create_order` through to `reserve_inventory`.
 
 ## Step 6 — Model `reserve_inventory`
 
@@ -279,53 +272,56 @@ Several things are working together here:
           lane_concurrency:
             kind: bounded
             value: 1
-    transactions:
-      tx.reserve_inventory:
-        data_model: data.inventory
-        isolation: read_committed
-        idempotency:
-          kind: not_deduplicated
-        steps:
-          - kind: read
-            result: read.reserve_inventory.stock
-            target:
-              object: object.stock
-              predicate:
-                kind: and
-                predicates:
-                  - kind: eq
-                    field: warehouse_id
-                    value:
-                      source: input:input.reserve_inventory.created
-                      path: warehouse_id
-                  - kind: eq
-                    field: sku
-                    value:
-                      source: input:input.reserve_inventory.created
-                      path: sku
-            fields:
-              kind: only
+    program:
+      steps:
+        - kind: transaction
+          id: tx.reserve_inventory
+          data_model: data.inventory
+          isolation: read_committed
+          idempotency:
+            kind: not_deduplicated
+          steps:
+            - kind: read
+              bind: read.reserve_inventory.stock
+              target:
+                object: object.stock
+                predicate:
+                  kind: and
+                  predicates:
+                    - kind: eq
+                      field: warehouse_id
+                      value:
+                        source: input:input.reserve_inventory.created
+                        path: warehouse_id
+                    - kind: eq
+                      field: sku
+                      value:
+                        source: input:input.reserve_inventory.created
+                        path: sku
               fields:
-                - on_hand
-                - reserved
-          - kind: write
-            target:
-              object: object.stock
-              predicate:
-                kind: and
-                predicates:
-                  - kind: eq
-                    field: warehouse_id
-                    value:
-                      source: input:input.reserve_inventory.created
-                      path: warehouse_id
-            values:
-              kind: deterministic
-              from:
-                - source: transaction_read:read.reserve_inventory.stock
-                  path: reserved
-                - source: input:input.reserve_inventory.created
-                  path: quantity
+                kind: only
+                fields:
+                  - on_hand
+                  - reserved
+            - kind: write
+              target:
+                object: object.stock
+                predicate:
+                  kind: and
+                  predicates:
+                    - kind: eq
+                      field: warehouse_id
+                      value:
+                        source: input:input.reserve_inventory.created
+                        path: warehouse_id
+              values:
+                kind: deterministic
+                from:
+                  - source: transaction_read:read.reserve_inventory.stock
+                    path: reserved
+                  - source: input:input.reserve_inventory.created
+                    path: quantity
+        # ... establish_effect_intent for InventoryReserved, then complete
 ```
 
 `tx.reserve_inventory` is explicitly `not_deduplicated`. Its write value derives from a `transaction_read` result, and transaction-read results are never replay-stable. Both facts together mean the verifier cannot prove the transaction is retry-safe by either route.
@@ -340,7 +336,7 @@ conseqa flash_checkout.yaml
 
 You will see an obligation summary with **10 proven** and **4 unknown**:
 
-```
+```text
 operation.apply_payment    serialization  proven
 operation.apply_payment    ordering       proven
 operation.apply_payment    idempotency    proven
