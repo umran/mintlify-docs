@@ -1,0 +1,228 @@
+---
+title: "State Machines and Lifecycle Transitions in Conseqa"
+sidebarTitle: "State Machines"
+description: "State machines model persistent lifecycle transitions over data objects. Learn how to declare states, transitions, and side effects in Conseqa."
+---
+
+State machines model the persistent lifecycle of data objects — the progression of an order from `pending` to `paid` or `cancelled`, or a transcode job from `queued` through `running` to `done` or `failed`. You declare a state machine once and then apply its transitions inside transaction steps across any number of operations. The verifier tracks which states are reachable, enforces that transitions fire only from permitted source states, and connects transition side effects to the artifact and idempotency machinery the rest of the model uses.
+
+## State machine fields
+
+```yaml
+state_machines:
+  machine.order_lifecycle:
+    subject:
+      kind: object
+      object: object.order
+      state: status
+    states:
+      - state.order.pending
+      - state.order.paid
+      - state.order.cancelled
+    initial: state.order.pending
+    transitions:
+      transition.order.cancel:
+        from:
+          - state.order.pending
+        to: state.order.cancelled
+        side_effects: {}
+      transition.order.mark_paid:
+        from:
+          - state.order.pending
+        to: state.order.paid
+        side_effects:
+          effect.order.paid:
+            kind: publication
+            topic: topic.order_events
+            schema: schema.OrderPaid
+            idempotency_key_propagation: []
+```
+
+| Field | Purpose |
+|---|---|
+| `subject` | Identifies which persistent object this machine governs and which field holds the state |
+| `states` | The complete enumerated set of valid states |
+| `initial` | The state every new object instance starts in |
+| `transitions` | The named transitions between states |
+
+## Subject
+
+The `subject` declaration ties the state machine to a concrete persistent object and a field in that object's schema:
+
+```yaml
+subject:
+  kind: object
+  object: object.order
+  state: status
+```
+
+`object` must reference a `DataObject` declared in a data model. `state` is the field path in the object's schema that holds the current state value. The state machine's declared `states` are the valid values of that field.
+
+## States and initial state
+
+`states` is the exhaustive list of valid state identifiers for this machine. `initial` names the state every freshly inserted object instance begins in. The verifier uses these declarations to check that transitions start from valid source states and arrive at valid target states.
+
+## Transitions
+
+Each transition declares:
+
+| Field | Purpose |
+|---|---|
+| `from` | The set of source states from which this transition may fire |
+| `to` | The target state after the transition fires |
+| `side_effects` | Effect declarations implicitly established as intents when the transition fires |
+
+A transition fires inside a `transition` transaction step. The operation that applies the transition selects the concrete object instance with a `subject` predicate.
+
+### Side effects
+
+Transition side effects are effect declarations that are automatically established as effect intents when the transition fires inside a transaction. The operation declares a corresponding `effect_intents` entry to name the intent artifact, and supplies a `effect_values` derivation at the transition step that provides the payload for that intent.
+
+```yaml
+transitions:
+  transition.video.mark_ready:
+    from:
+      - state.video.uploaded
+    to: state.video.ready
+    side_effects:
+      effect.video.published:
+        kind: publication
+        topic: topic.video_events
+        schema: schema.VideoPublished
+        idempotency_key_propagation: []
+```
+
+When an operation applies `transition.video.mark_ready`, it must supply `effect_values` for `effect.video.published` in the transition step:
+
+```yaml
+- kind: transition
+  machine: machine.video_lifecycle
+  transition: transition.video.mark_ready
+  subject:
+    object: object.video
+    predicate:
+      kind: eq
+      field: video_id
+      value:
+        source: input:input.publish_video.completed
+        path: video_id
+  effect_values:
+    effect.video.published:
+      kind: deterministic
+      from:
+        - source: input:input.publish_video.completed
+          path: event_id
+        - source: input:input.publish_video.completed
+          path: video_id
+        - source: input:input.publish_video.completed
+          path: manifest_uri
+```
+
+The operation must also declare an `effect_intents` entry that names the side effect's intent. The artifact is then available through `execute_effect_intent` in the program.
+
+```yaml
+effect_intents:
+  intent.publish_video.published:
+    effect: effect.video.published
+```
+
+<Note>
+Transition side effects are never executed directly with `execute_effect`. They are always established as intents by the transition step and executed later through `execute_effect_intent`. This ensures the intent payload is captured atomically with the state change.
+</Note>
+
+## How transitions appear in programs
+
+A typical pattern for state-machine-driven operations is:
+
+<Steps>
+  <Step title="Apply the transition inside a transaction">
+    The `transition` step changes the object's state field and atomically establishes the side-effect intents.
+  </Step>
+  <Step title="Execute the side-effect intent">
+    After the transaction commits, an `execute_effect_intent` step fires the publication or request effect whose payload was captured by the transition.
+  </Step>
+  <Step title="Terminate">
+    A `return` or `complete` step ends the operation.
+  </Step>
+</Steps>
+
+```yaml
+program:
+  steps:
+    - kind: transaction
+      transaction: tx.publish_video.ready
+    - kind: execute_effect_intent
+      intent: intent.publish_video.published
+    - kind: complete
+```
+
+## A complete two-machine example
+
+The following is the pair of state machines from the video streaming fixture — one for the video record lifecycle and one for the transcode job lifecycle.
+
+```yaml
+state_machines:
+  machine.video_lifecycle:
+    subject:
+      kind: object
+      object: object.video
+      state: status
+    states:
+      - state.video.failed
+      - state.video.ready
+      - state.video.uploaded
+    initial: state.video.uploaded
+    transitions:
+      transition.video.mark_failed:
+        from:
+          - state.video.uploaded
+        to: state.video.failed
+        side_effects: {}
+      transition.video.mark_ready:
+        from:
+          - state.video.uploaded
+        to: state.video.ready
+        side_effects:
+          effect.video.published:
+            kind: publication
+            topic: topic.video_events
+            schema: schema.VideoPublished
+            idempotency_key_propagation: []
+
+  machine.job_lifecycle:
+    subject:
+      kind: object
+      object: object.job
+      state: status
+    states:
+      - state.job.done
+      - state.job.failed
+      - state.job.queued
+      - state.job.running
+    initial: state.job.queued
+    transitions:
+      transition.job.start:
+        from:
+          - state.job.queued
+        to: state.job.running
+        side_effects: {}
+      transition.job.complete:
+        from:
+          - state.job.running
+        to: state.job.done
+        side_effects:
+          effect.job.completed:
+            kind: publication
+            topic: topic.video_events
+            schema: schema.TranscodeCompleted
+            idempotency_key_propagation: []
+      transition.job.fail:
+        from:
+          - state.job.running
+        to: state.job.failed
+        side_effects: {}
+```
+
+## State machines in the visualization
+
+When you run `conseqa-viz model.yaml`, the visualization renders each state machine as a labeled directed graph. States appear as nodes and transitions as edges. Side effects are annotated on the relevant transition edges, making it easy to trace which state changes trigger which publications or requests. Use the `--verify` flag to overlay verification verdicts on the diagram.

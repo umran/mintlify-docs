@@ -1,0 +1,200 @@
+---
+title: "Obligation Report Format: Structure and Fields Reference"
+sidebarTitle: "Obligations Report"
+description: "Conseqa writes a JSON report of every verification obligation — status, assumptions, and evidence — consumable by conseqa-viz and any tooling you build."
+---
+
+When you run `conseqa` with `--report`, the verifier writes a structured JSON file containing every obligation it evaluated: its status, the declared facts the proof depends on, and the checker's evidence for gaps. This report is the machine-readable interface between Conseqa and visualization, CI, and any custom tooling you build.
+
+```bash
+conseqa model.yaml --report output.json
+```
+
+## Report Structure
+
+The top-level report object has format version `2`, the model revision the report was produced against, the list of obligations, and any model-wide notes.
+
+```json
+{
+  "format": 2,
+  "model_revision": 1,
+  "obligations": [...]
+}
+```
+
+When the verifier raises model-wide notes, a `"notes"` array also appears at the top level. It is omitted entirely when there are none.
+
+<ParamField path="format" type="integer" required>
+  Always `2` for reports produced by the current engine. `conseqa-viz` warns if
+  a report's format version does not match what it expects.
+</ParamField>
+
+<ParamField path="model_revision" type="integer">
+  The `revision` value from the model at the time the report was produced.
+  `conseqa-viz` warns when you overlay a report against a model whose revision
+  does not match.
+</ParamField>
+
+<ParamField path="obligations" type="Obligation[]" required>
+  One entry per declared requirement. See the obligation fields below.
+</ParamField>
+
+<ParamField path="notes" type="EvidenceItem[]">
+  Model-wide warnings not tied to a specific obligation. Omitted from the JSON
+  when empty. The most common note is raised when a subscription admits duplicate
+  deliveries (`at_least_once`) but the operation declares no idempotency
+  requirement keyed from it.
+</ParamField>
+
+## Obligation Fields
+
+Each obligation in the `obligations` array describes one declared requirement and the verifier's findings about it.
+
+<ParamField path="id" type="string" required>
+  A stable logical identifier for the obligation, derived from the operation and
+  requirement index. Example: `oblig.operation.apply_payment.idempotency.0`.
+</ParamField>
+
+<ParamField path="property" type="object" required>
+  The requirement family. The `kind` field is one of `serialization`,
+  `ordering`, `idempotency`, `recoverability`, or `result_replay`.
+</ParamField>
+
+<ParamField path="subject" type="object" required>
+  What the obligation anchors to. The `kind` field is one of `operation`,
+  `transaction`, `object`, `state_machine`, or `topic`. For operation
+  obligations, the subject also names the `operation` id and the `requirement`
+  index within that operation's requirement list.
+</ParamField>
+
+<ParamField path="status" type="string" required>
+  The verdict: `proven`, `unknown`, or `disproven`. See
+  [Verdicts](/verification/verdicts) for the precise meaning of each.
+</ParamField>
+
+<ParamField path="summary" type="string" required>
+  A human-readable one-sentence description of what the obligation claims.
+  Example: `"Repeated attempts at operation.apply_payment sharing the declared
+  key produce the effects of a single invocation."`
+</ParamField>
+
+<ParamField path="assumptions" type="string[]" required>
+  For `proven` obligations: the declared facts the proof depends on,
+  enumerated as human-readable statements. The proof holds only as long as your
+  implementation actually provides these semantics.
+</ParamField>
+
+<ParamField path="evidence" type="EvidenceItem[]" required>
+  For `unknown` or `disproven` obligations: the checker's obstacles, each with
+  an optional `subject` ID naming the entity involved and a `message` describing
+  the gap. For `proven` obligations this is an empty array.
+</ParamField>
+
+<ParamField path="counterexample" type="object">
+  Present only for `disproven` obligations. Contains a `trace` array of
+  `TraceStep` objects demonstrating the violation.
+</ParamField>
+
+## A Real Report Snippet
+
+The following excerpt is from the `flash_checkout` example model's report, produced by running Conseqa against that model. It shows one proven obligation and one unknown obligation side by side.
+
+```json
+{
+  "format": 2,
+  "model_revision": 1,
+  "obligations": [
+    {
+      "id": "oblig.operation.apply_payment.idempotency.0",
+      "property": { "kind": "idempotency" },
+      "subject": {
+        "kind": "operation",
+        "operation": "operation.apply_payment",
+        "requirement": 0
+      },
+      "status": "proven",
+      "summary": "Repeated attempts at operation.apply_payment sharing the declared key produce the effects of a single invocation.",
+      "assumptions": [
+        "tx.apply_payment commits are deduplicated by input.apply_payment.captured.event_id, stable across the attempt class",
+        "duplicate executions of effect.order.paid publish the same logical message under topic.order_events's message identity (intent intent.apply_payment.order_paid is recovered from tx.apply_payment's keyed commit)",
+        "no modeled subscription on topic.order_events admits schema.OrderPaid; the cascade ends at the topic",
+        "the identity of schema.PaymentCaptured on topic.order_events is carried by its producer's idempotency key (input.charge_payment.reserved.event_id, requirement #0): declared propagation from operation.charge_payment through effect.charge_payment.publish_captured"
+      ],
+      "evidence": []
+    },
+    {
+      "id": "oblig.operation.charge_payment.idempotency.0",
+      "property": { "kind": "idempotency" },
+      "subject": {
+        "kind": "operation",
+        "operation": "operation.charge_payment",
+        "requirement": 0
+      },
+      "status": "unknown",
+      "summary": "Repeated attempts at operation.charge_payment sharing the declared key produce the effects of a single invocation.",
+      "assumptions": [
+        "the identity of schema.InventoryReserved on topic.order_events is carried by its producer's idempotency key (input.reserve_inventory.created.event_id, requirement #0): declared propagation from operation.reserve_inventory through effect.reserve_inventory.publish_reserved"
+      ],
+      "evidence": [
+        {
+          "subject": "effect.charge_payment.card",
+          "message": "The path `ok(result.charge_payment.card)` executes external effect `effect.charge_payment.card`, which is explicitly `not_deduplicated`: a duplicate execution is distinguishable duplicate work at that boundary."
+        },
+        {
+          "message": "On the path `ok(result.charge_payment.card)`, the match on `result.charge_payment.card` at step `2`, taking its `ok` arm is not established to replay, so a retry may do different work: result `result.charge_payment.card` of `effect.charge_payment.card` is not replay-stable: the external boundary is explicitly `not_deduplicated`, so no same-key terminal result is fixed."
+        }
+      ]
+    }
+  ]
+}
+```
+
+<Note>
+  The `assumptions` list for a proven obligation names every declared fact the
+  proof depends on. Review these after any implementation change to confirm the
+  real system still provides those semantics.
+</Note>
+
+## Using the Report with conseqa-viz
+
+Pass the report to `conseqa-viz` with `--report` to overlay proof verdicts on the architecture visualization:
+
+```bash
+conseqa-viz model.yaml --report output.json
+```
+
+Or run the model checker and overlay the results in one step:
+
+```bash
+conseqa-viz model.yaml --verify
+```
+
+When a report is loaded, `conseqa-viz` colors operations, topics, and state machines by their worst obligation status, adds verdict chips to requirement rows in the operation view, and populates the obligations panel with expandable cards showing assumptions, evidence, and counterexample traces.
+
+## Scaffolding a Report with `--example-report`
+
+The `--example-report` flag on `conseqa-viz` generates a scaffold report in which every obligation implied by the model is listed with its status set to `unknown`. This is useful for understanding the report format, annotating obligations manually, or bootstrapping a custom report for tooling that consumes the format.
+
+```bash
+conseqa-viz model.yaml --example-report
+# prints JSON to stdout
+
+conseqa-viz model.yaml --example-report --out scaffold.json
+# writes to scaffold.json
+```
+
+The scaffold follows the same format as a real report. Every `assumptions` and `evidence` array is empty; every `status` is `"unknown"`. You can edit the scaffold and pass it back to `conseqa-viz --report` to overlay custom annotations.
+
+<Accordion title="Complete obligation ID structure">
+  Obligation IDs follow the pattern:
+
+  ```
+  oblig.<subject-kind>.<subject-id>.<property>.<index>
+  ```
+
+  For example:
+  - `oblig.operation.apply_payment.serialization.0` — the first serialization requirement on `operation.apply_payment`
+  - `oblig.operation.create_order.result_replay.0` — the result replay obligation on `create_order`'s first idempotency requirement (which declared `result: replay_consistent`)
+
+  IDs are stable within a model revision. If you add or remove requirements, indices change for requirements declared later in the same list.
+</Accordion>

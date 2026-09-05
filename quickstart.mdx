@@ -1,0 +1,222 @@
+---
+title: "Quickstart: Verify Your First Conseqa Model in Minutes"
+sidebarTitle: "Quickstart"
+description: "Install Conseqa, write a minimal YAML model, run the verifier, and generate an interactive visualization — all in a single walkthrough."
+---
+
+This guide walks you through installing Conseqa from source, writing a minimal model, running your first verification, and exploring the result in the interactive visualizer. By the end you will have a working model on disk and know how to extend it.
+
+<Steps>
+  <Step title="Install Conseqa">
+    Conseqa builds from source with the standard Rust toolchain. You need a recent stable Rust release; no other runtime dependencies are required.
+
+    Clone the repository and build both binaries in release mode:
+
+    ```bash
+    git clone https://github.com/umran/conseqa
+    cd conseqa
+    cargo build --release
+    ```
+
+    This produces two binaries:
+
+    - `target/release/conseqa` — the validator and verifier
+    - `target/release/conseqa-viz` — the visualization tool
+
+    Optionally add them to your `PATH`:
+
+    ```bash
+    export PATH="$PWD/target/release:$PATH"
+    ```
+
+    Confirm both tools are reachable:
+
+    ```bash
+    conseqa --help
+    conseqa-viz --help
+    ```
+
+    <Note>
+      The `conseqa-viz` front end is a pre-built React bundle embedded in the binary at compile time. You do not need Node.js to run it — only to rebuild the front end itself after modifying `viz/`.
+    </Note>
+  </Step>
+
+  <Step title="Write a minimal model">
+    Create a file called `model.yaml`. The model below declares a single `backend` service, a canonical schema for a completed upload, and a keyed topic that carries it. It has no operations or requirements yet, so there is nothing to verify — but it is a valid, parseable starting point.
+
+    ```yaml
+    revision: 1
+
+    services:
+      service.ingest:
+        kind: backend
+
+    schemas:
+      schema.UploadCompleteRequest:
+        kind: canonical
+        description: A client reports that an upload to the object store has finished.
+        completeness: complete
+        fields:
+          upload_id: string
+          video_id: uuid
+          owner_id: uuid
+          source_uri: string
+
+      schema.VideoUploaded:
+        kind: canonical
+        description: A new source video is available for transcoding.
+        completeness: complete
+        fields:
+          event_id: string
+          video_id: uuid
+          owner_id: uuid
+          source_uri: string
+
+    data_models: {}
+
+    topics:
+      topic.video_events:
+        messages:
+          - schema.VideoUploaded
+        ordering:
+          kind: keyed
+          mapping:
+            schema.VideoUploaded: video_id
+        message_identity:
+          kind: keyed
+          mapping:
+            schema.VideoUploaded:
+              - event_id
+
+    state_machines: {}
+
+    operations: {}
+    ```
+
+    <Tip>
+      The `completeness: complete` declaration tells the verifier this schema describes the full logical shape. Fields absent from a complete schema are treated as nonexistent. Use `partial` when the real schema may contain undeclared fields.
+    </Tip>
+  </Step>
+
+  <Step title="Run the verifier">
+    Pass your model to `conseqa`:
+
+    ```bash
+    conseqa model.yaml
+    ```
+
+    With no operations declared, there are no requirements to discharge:
+
+    ```text
+    obligations: 0 proven, 0 unknown, 0 disproven (0 total)
+    ```
+
+    Now try the fuller example from the repository's test fixtures, which models a complete video streaming pipeline with four services and every obligation proven:
+
+    ```bash
+    conseqa tests/fixtures/video_streaming.yaml
+    ```
+
+    ```text
+    obligations: 8 proven, 0 unknown, 0 disproven (8 total)
+    ```
+
+    For a model with deliberate gaps, run the flash checkout fixture. The checker reports each gap honestly:
+
+    ```bash
+    conseqa tests/fixtures/flash_checkout.yaml
+    ```
+
+    ```text
+    obligations: 10 proven, 4 unknown, 0 disproven (14 total)
+    ```
+
+    <Note>
+      `unknown` is epistemic — it means the verifier could not establish the property from the declared facts. It is not evidence of a violation. The flash checkout model deliberately leaves `tx.reserve_inventory` without keyed-commit deduplication, which is why its idempotency and recoverability obligations are unknown.
+    </Note>
+
+    To save the full obligation report as JSON for later use or visualization:
+
+    ```bash
+    conseqa tests/fixtures/video_streaming.yaml --report video_streaming.report.json
+    ```
+
+    ```text
+    obligations: 8 proven, 0 unknown, 0 disproven (8 total)
+    wrote video_streaming.report.json
+    ```
+
+    The JSON report follows the `ProverReport` format (`format: 2`). Each obligation object carries an `id`, `property`, `subject`, `status`, `summary`, `assumptions`, and `evidence` array.
+  </Step>
+
+  <Step title="Generate a visualization">
+    Run `conseqa-viz` with `--verify` to produce and overlay the obligation report in one step:
+
+    ```bash
+    conseqa-viz tests/fixtures/video_streaming.yaml --verify --out video_streaming.html
+    ```
+
+    ```text
+    wrote video_streaming.html
+    ```
+
+    You can also overlay a report you produced earlier:
+
+    ```bash
+    conseqa-viz tests/fixtures/video_streaming.yaml \
+      --report video_streaming.report.json \
+      --out video_streaming.html
+    ```
+
+    Other useful options:
+
+    ```bash
+    # Set a custom page title
+    conseqa-viz model.yaml --verify --title "Upload pipeline" --out upload.html
+
+    # Generate a scaffold report with every obligation status unknown
+    # (useful for understanding the report format)
+    conseqa-viz model.yaml --example-report
+
+    # Skip validation warnings during rendering
+    conseqa-viz model.yaml --verify --no-validate --out model.html
+    ```
+  </Step>
+
+  <Step title="Open the HTML output">
+    Open the generated file in any browser. The visualization makes no external network requests and works directly from disk:
+
+    ```bash
+    open video_streaming.html         # macOS
+    xdg-open video_streaming.html     # Linux
+    start video_streaming.html        # Windows
+    ```
+
+    The visualization has three main views:
+
+    <AccordionGroup>
+      <Accordion title="System view (#/system)">
+        Services are drawn as boundary boxes with their operations inside. Topics, external systems, and a synthetic "clients" vertex sit around them. Edges are the model's information routes: publications, subscriptions, request effects, and external effects. Solid edges carry program step details; dashed edges are declared but unexecuted capabilities. Click any vertex or edge for a structured detail panel.
+      </Accordion>
+      <Accordion title="Operation view (#/op/<id>)">
+        Shows a page header with the operation's facts, then its declared requirements (with obligation status when a report is loaded), its inputs, and a full program diagram — every step in order, transactions expanded in place, match/branch arms side by side, and step locations labeled as the checker names them (`3`, `3.ok.1`).
+      </Accordion>
+      <Accordion title="State machine view (#/machine/<id>)">
+        Displays the state graph with legal states, the initial state, and transitions annotated with side effects. A transitions table shows from/to sets and the operations that execute each transition through an intent.
+      </Accordion>
+    </AccordionGroup>
+
+    When a report is loaded, every vertex gains a status ring and a rollup chip (worst status wins: `disproven` > `unknown` > `proven`). The obligations panel groups obligations by the operation they anchor to, with a status filter and expandable evidence cards.
+  </Step>
+</Steps>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Core Concepts" icon="shapes" href="/concepts/model-overview">
+    Learn how operations, requirements, and the proof mechanics fit together.
+  </Card>
+  <Card title="CLI Reference" icon="terminal" href="/cli/conseqa">
+    Full reference for every flag on `conseqa` and `conseqa-viz`.
+  </Card>
+</CardGroup>

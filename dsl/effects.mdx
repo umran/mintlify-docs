@@ -1,0 +1,287 @@
+---
+title: "Conseqa DSL Effects: Publication, Request, External"
+sidebarTitle: "Effects"
+description: "Reference for Conseqa's three effect kinds — publication, request, and external — covering idempotency guarantees, retry semantics, and propagation."
+---
+
+Effects are how an operation interacts with the world outside its own transaction state. They cover publishing messages to topics, calling other operations, and invoking external systems. Declaring an effect in `operation.effects` is a capability declaration, not an execution: an effect runs only when a program step explicitly executes it. How the values of a particular effect instance are computed is declared at the execution site, not on the effect contract itself.
+
+## Effect contracts and effect instances
+
+An effect declaration is a contract. It describes the kind of work, the destination, the schema, the retry or idempotency guarantee, and any key propagation. It does not say when the effect runs or what specific values it carries — those are fixed at each execution or establishment site:
+
+- an `execute_effect` program step constructs and runs the effect directly, with a `values` derivation;
+- an `establish_effect_intent` transaction step captures the effect as a durable artifact, also with a `values` derivation;
+- an `execute_effect_intent` program step runs a previously established intent — the values were fixed at establishment and are not recomputed.
+
+---
+
+## Publication effect
+
+A publication effect sends a message carrying one schema to one topic. Publications have no synchronous result — you cannot bind a result from executing a publication.
+
+```yaml
+effects:
+  effect.create_order.publish_created:
+    kind: publication
+    topic: topic.order_events
+    schema: schema.OrderCreated
+    idempotency_key_propagation:
+      - source:
+          components:
+            - source: input:input.create_order.request
+              path: idempotency_key
+        target:
+          components:
+            - source: effect:effect.create_order.publish_created
+              path: event_id
+```
+
+<ParamField path="kind" type="string" required>
+  Must be `publication`.
+</ParamField>
+
+<ParamField path="topic" type="Id" required>
+  The topic to publish to. Must be declared in the model's `topics` map, and the `schema` must appear in `topic.messages`.
+</ParamField>
+
+<ParamField path="schema" type="Id" required>
+  The schema of the published message.
+</ParamField>
+
+<ParamField path="idempotency_key_propagation" type="list[IdempotencyKeyPropagation]" required>
+  Declares that certain values in the published payload carry the same logical idempotency identity as upstream values. This is a lineage assertion — it does not deduplicate publications. See [Idempotency key propagation](#idempotency-key-propagation).
+</ParamField>
+
+### When a duplicate publication is safe
+
+For an upstream idempotency requirement, a repeated publication is safe only when two conditions both hold:
+
+1. The topic declares a keyed `message_identity` mapping the published schema, and the published instance is class-fixed (replay-deterministic for a direct execution, or available by route A or B for an intent). Every attempt then publishes the **same logical message**.
+2. Every modeled consumer of that message collapses duplicate deliveries — either through a proven idempotency requirement keyed from that subscription, or because the subscription declares `delivery: at_most_once`.
+
+A publication declaration alone does not imply exactly-once delivery, atomic commit, deduplication, or that the effect runs at all.
+
+---
+
+## Request effect
+
+A request effect invokes a specific request input of another operation. It inherits the `Result<Ok, Err>` contract declared on the target input — you do not redeclare the result schema on the effect.
+
+```yaml
+effects:
+  effect.notify.send_confirmation:
+    kind: request
+    target:
+      operation: operation.email_service
+      input: input.email_service.send
+    schema: schema.SendEmailRequest
+    retry: may_repeat
+    idempotency_key_propagation:
+      - source:
+          components:
+            - source: input:input.create_order.request
+              path: idempotency_key
+        target:
+          components:
+            - source: effect:effect.notify.send_confirmation
+              path: request_id
+```
+
+<ParamField path="kind" type="string" required>
+  Must be `request`.
+</ParamField>
+
+<ParamField path="target" type="object" required>
+  Identifies the destination operation and input.
+
+  - `operation` — the ID of the target operation
+  - `input` — the ID of the request input within that operation
+</ParamField>
+
+<ParamField path="schema" type="Id" required>
+  The schema of the outbound request payload. Must match the target input's declared schema.
+</ParamField>
+
+<ParamField path="retry" type="string" required>
+  Declares whether the requesting boundary may issue repeated attempts for the same logical request.
+
+  - `never` — the mechanism does not intentionally repeat the request. This is a sender-side fact only; it does not guarantee exactly-once delivery across all failure modes.
+  - `may_repeat` — the logical request may be attempted more than once. Downstream duplicate invocation must be expected.
+  - `unspecified` — no retry fact is declared. The verifier treats this as unknown.
+</ParamField>
+
+<ParamField path="idempotency_key_propagation" type="list[IdempotencyKeyPropagation]" required>
+  Links outbound request key fields to upstream logical identity. See [Idempotency key propagation](#idempotency-key-propagation).
+</ParamField>
+
+### Inherited result contract
+
+A request effect's synchronous result is exactly the `Result<Ok, Err>` declared on the targeted input. You bind it at the execution site:
+
+```yaml
+# In the program:
+- kind: execute_effect
+  effect: effect.notify.send_confirmation
+  values:
+    kind: deterministic
+    from:
+      - source: input:input.create_order.request
+        path: order_id
+  result: result.notify.send_confirmation   # binds the result for match_result
+```
+
+### When a duplicate request is safe
+
+A duplicate request invocation is safe when the executed instance is class-fixed, the effect's schema matches the target input's schema, and the target operation declares a proven idempotency requirement keyed from that input. Payload-equal duplicates then fall into one class of that requirement, which collapses them to the work of a single logical invocation.
+
+---
+
+## External effect
+
+An external effect marks a boundary Conseqa cannot inspect. Because the verifier cannot analyze the external implementation, you must explicitly declare its idempotency behavior and, if applicable, its synchronous result.
+
+```yaml
+effects:
+  effect.charge_payment.card:
+    kind: external
+    name: payment-provider.charge
+    idempotency:
+      kind: not_deduplicated
+    result:
+      ok: schema.ChargeAccepted
+      err:
+        schema: schema.ChargeDeclined
+        disposition: terminal
+
+  effect.notify_published.push:
+    kind: external
+    name: push-gateway.notify
+    idempotency:
+      kind: deduplicated_by
+      key:
+        components:
+          - source: input:input.notify_published.published
+            path: event_id
+    result: null
+```
+
+<ParamField path="kind" type="string" required>
+  Must be `external`.
+</ParamField>
+
+<ParamField path="name" type="string" required>
+  A descriptive label for the external system. Used in diagnostics and reports; has no proof semantics.
+</ParamField>
+
+<ParamField path="idempotency" type="object" required>
+  Declares the external boundary's deduplication guarantee. One of three forms:
+
+  - `kind: unspecified` — no deduplication fact is available. The verifier treats duplicate executions as potentially unsafe.
+  - `kind: not_deduplicated` — repeated execution is explicitly not deduplicated. A retry path reaching this effect is potentially unsafe for an upstream idempotency requirement.
+  - `kind: deduplicated_by` with a `key` — the external boundary guarantees deduplication for executions sharing the declared key. A duplicate execution is safe when every component of the key is replay-stable relative to the governing key.
+</ParamField>
+
+<ParamField path="result" type="object | null" required>
+  The synchronous result the boundary returns, or `null` if no result is modeled.
+
+  When present, declare:
+  - `ok` — the ID of the `Ok` schema
+  - `err.schema` — the ID of the `Err` schema
+  - `err.disposition` — one of `terminal`, `retryable`, or `unspecified`
+
+  For a result-bearing effect with `deduplicated_by`, equal evaluated keys fix the terminal logical result: once the first terminal `Ok` or terminal `Err` is observed, every subsequent same-key execution returns the same variant and a replay-equivalent payload. A `retryable` `Err` does not establish a terminal result.
+</ParamField>
+
+### `ErrorDisposition` values
+
+| Value | Meaning |
+|---|---|
+| `terminal` | Observing this `Err` terminally resolves the logical interaction. The verifier can use it as a stable root. |
+| `retryable` | This `Err` ends the current attempt but does not terminally resolve the interaction; another attempt is semantically admitted. The verifier cannot use it as a stable root. |
+| `unspecified` | No terminality fact is declared. The verifier treats the observation as unknown. |
+
+A bare schema ID in `err` is shorthand for `disposition: unspecified`.
+
+---
+
+## Effect intents
+
+An effect intent is a durable transaction artifact that captures an effect instance for later execution. The intent pattern enables at-least-once execution across failures: the intent is established inside a transaction (so it commits atomically with application state), and executed by a later program step.
+
+```yaml
+# Declare the intent on the operation:
+effect_intents:
+  intent.create_order.publish_created:
+    effect: effect.create_order.publish_created
+
+# Establish it inside a transaction step:
+- kind: establish_effect_intent
+  intent: intent.create_order.publish_created
+  values:
+    kind: deterministic
+    from:
+      - source: input:input.create_order.request
+        path: order_id
+      - source: input:input.create_order.request
+        path: idempotency_key
+
+# Execute it in a later program step:
+- kind: execute_effect_intent
+  intent: intent.create_order.publish_created
+```
+
+<ParamField path="effect" type="Id" required>
+  The effect this intent will execute. Must be declared in the operation's `effects` map.
+</ParamField>
+
+Establishing an intent constructs one logical instance of its effect — values are fixed at establishment, not at execution. `execute_effect_intent` runs that fixed instance and does not recompute the values.
+
+<Tip>
+  An intent declaration does not imply an automatic background executor. The intent executes only when a program step explicitly runs it via `execute_effect_intent`. Retry availability depends on whether the establishing transaction uses natural replay (route A) or an explicit `deduplicated_by` commit (route B).
+</Tip>
+
+Reconstructing or recovering the same intent does not prove that repeating the underlying external effect is safe. A crash after an external effect succeeds but before its completion is durably known may lead to another effect attempt — the effect's own idempotency guarantee handles that uncertainty.
+
+---
+
+## Idempotency key propagation
+
+`idempotency_key_propagation` on a publication or request effect declares that certain values in the outbound payload carry the same logical idempotency identity as upstream values. It is a lineage assertion that lets the verifier trace the same logical key across effect boundaries.
+
+```yaml
+idempotency_key_propagation:
+  - source:
+      components:
+        - source: input:input.reserve_inventory.created
+          path: event_id
+    target:
+      components:
+        - source: effect:effect.reserve_inventory.publish_reserved
+          path: event_id
+```
+
+The `source` components identify the upstream key fields; the `target` components identify the corresponding fields in the outbound payload. Propagation does **not** deduplicate anything — it tells the verifier that a consumer observing the target fields is observing the same logical key as the producer's source fields.
+
+<Note>
+  Propagation plays no role in the publication duplicate-safety discharge. A class-fixed publication instance already makes every duplicate payload-equal, so a consumer's key evaluates the same across all duplicates regardless of whether propagation was declared.
+</Note>
+
+---
+
+## Summary of effect kinds
+
+| Kind | Has synchronous result? | Idempotency declared how? |
+|---|---|---|
+| `publication` | No — cannot bind a result | Via topic `message_identity` + consumer requirements |
+| `request` | Yes — inherits from target input | Via target operation's idempotency requirement |
+| `external` | Optional (`result:` or `null`) | Explicitly: `unspecified`, `not_deduplicated`, or `deduplicated_by` |
+
+<CardGroup cols={2}>
+  <Card title="Program Control" icon="code-branch" href="/dsl/program-control">
+    How to execute effects using execute_effect and execute_effect_intent steps
+  </Card>
+  <Card title="Value References" icon="link" href="/dsl/value-references">
+    How to declare the values derivation for effect execution sites
+  </Card>
+</CardGroup>

@@ -1,0 +1,206 @@
+---
+title: "Conseqa DSL Model Structure: All Seven Top-Level Keys"
+sidebarTitle: "Model Structure"
+description: "Complete reference for the top-level keys of a Conseqa YAML model: revision, services, schemas, data_models, topics, state_machines, and operations."
+---
+
+Every Conseqa model is a single YAML file whose root object is a `Model`. The file declares one logical architecture snapshot — a revision-stamped collection of services, schemas, data objects, topics, state machines, and operations. Validation checks that all references are coherent; verification checks whether the requirements declared inside `operations` follow from the declared facts and architecture.
+
+## Top-level fields
+
+<ParamField path="revision" type="integer" required>
+  An opaque numeric revision marker for the model. Conseqa assigns no ordering, compatibility, or migration semantics beyond numeric identity — it is a label you control.
+</ParamField>
+
+<ParamField path="services" type="map[Id → Service]" required>
+  A map of service declarations. Each service is a logical ownership boundary that groups related operations. See [Service kinds](#services) below.
+</ParamField>
+
+<ParamField path="schemas" type="map[Id → Schema]" required>
+  A map of schema declarations — both `canonical` shapes and `fragment` projections. Schemas describe the logical type of every payload, field, and data object in the model. See [Field Types](/dsl/field-types).
+</ParamField>
+
+<ParamField path="data_models" type="map[Id → DataModel]" required>
+  A map of data model declarations. A data model is a logical transactional state boundary containing persistent object classes. Required even when empty (`data_models: {}`).
+</ParamField>
+
+<ParamField path="topics" type="map[Id → Topic]" required>
+  A map of topic declarations. Topics carry messages between producers and consumers and declare ordering and identity guarantees.
+</ParamField>
+
+<ParamField path="state_machines" type="map[Id → StateMachine]" required>
+  A map of state machine declarations. A state machine governs the lifecycle of a data object by declaring valid states, transitions, and per-transition side effects. Required even when empty (`state_machines: {}`).
+</ParamField>
+
+<ParamField path="operations" type="map[Id → Operation]" required>
+  A map of operation declarations. Each operation belongs to one service and declares inputs, effects, transactions, a program, and requirements to verify. Required even when empty (`operations: {}`).
+</ParamField>
+
+---
+
+## Services
+
+A service groups related operations under a logical ownership boundary. It carries a `kind` that classifies its role in the architecture.
+
+<ParamField path="kind" type="string" required>
+  One of `backend`, `frontend`, `worker`, or `job`. These are descriptive labels only — a kind does not itself imply a process boundary, network hop, replica count, or failure-independence model.
+</ParamField>
+
+```yaml
+services:
+  service.checkout:
+    kind: backend
+  service.inventory:
+    kind: backend
+  service.payments:
+    kind: worker
+```
+
+---
+
+## Annotated skeleton
+
+The following skeleton shows every top-level key and its relationship to the rest of the model. Each section links to the relevant reference page.
+
+```yaml
+# Opaque revision marker — increment it however your team tracks changes.
+revision: 1
+
+# ── Services ──────────────────────────────────────────────────────────────
+# Logical ownership boundaries for operations.
+services:
+  service.checkout:
+    kind: backend          # backend | frontend | worker | job
+
+# ── Schemas ───────────────────────────────────────────────────────────────
+# Logical shapes for payloads, messages, and data objects.
+# See: /dsl/field-types
+schemas:
+  schema.CreateOrderRequest:
+    kind: canonical
+    completeness: complete  # complete | partial
+    fields:
+      order_id: uuid
+      idempotency_key: string
+      amount: decimal
+
+  schema.OrderSummary:
+    kind: fragment
+    source: schema.CreateOrderRequest
+    mapping:
+      id: order_id           # fragment field -> source field path
+
+# ── Data models ───────────────────────────────────────────────────────────
+# Logical transactional state boundaries containing persistent objects.
+data_models:
+  data.checkout:
+    objects:
+      object.order:
+        schema: schema.OrderRecord
+        identity:
+          - order_id          # each entry is one field path in the composite identity tuple
+
+# ── Topics ────────────────────────────────────────────────────────────────
+# Named channels for event-driven message delivery.
+topics:
+  topic.order_events:
+    messages:
+      - schema.OrderCreated
+    ordering:
+      kind: keyed             # unspecified | unordered | global | keyed
+      mapping:
+        schema.OrderCreated: order_id
+    message_identity:
+      kind: keyed
+      mapping:
+        schema.OrderCreated:
+          - event_id
+
+# ── State machines ────────────────────────────────────────────────────────
+# Object lifecycle declarations with valid transitions and side effects.
+state_machines:
+  machine.order_lifecycle:
+    subject:
+      kind: object
+      object: object.order
+      state: status           # field on object.order that holds the state
+    states:
+      - state.order.pending
+      - state.order.paid
+      - state.order.cancelled
+    initial: state.order.pending
+    transitions:
+      transition.order.mark_paid:
+        from:
+          - state.order.pending
+        to: state.order.paid
+        side_effects: {}
+
+# ── Operations ────────────────────────────────────────────────────────────
+# Logical units of application behavior.
+# See: /dsl/effects, /dsl/program-control, /dsl/value-references
+operations:
+  operation.create_order:
+    service: service.checkout
+    description: "Optional prose — no proof semantics."
+    inputs:
+      input.create_order.request:
+        kind: request
+        schema: schema.CreateOrderRequest
+        identity:
+          kind: keyed
+          fields:
+            - idempotency_key
+        result:
+          ok: schema.CreateOrderResponse
+          err: schema.RequestRejected
+    effects: {}
+    effect_intents: {}
+    transaction_outputs: {}
+    transactions: {}
+    program:
+      steps:
+        - kind: complete
+    requirements:
+      serialization: []
+      ordering: []
+      idempotency: []
+      recoverability: []
+    execution:
+      concurrency:
+        kind: unbounded
+```
+
+---
+
+## ID conventions
+
+Every key in the maps above is a logical `Id` — a string you choose. Conseqa treats IDs as opaque logical names, not runtime addresses, database keys, or deployment identifiers. The namespaced dot-separated style (`service.checkout`, `schema.CreateOrderRequest`) used throughout the fixtures is a convention, not a requirement.
+
+<Note>
+  IDs must be unique within their map. A schema named `string`, `bool`, `int`, `float`, `decimal`, `uuid`, or `timestamp` conflicts with the scalar type shorthand and must use the canonical field-map form wherever its type is referenced. See [Field Types](/dsl/field-types).
+</Note>
+
+---
+
+## What validation and verification check
+
+Validation and verification are two separate passes:
+
+- **Validation** (structural) checks that every reference resolves, programs terminate on every path, artifacts are definitely available where consumed, and result bindings are in scope. A structurally valid model may still have unproven requirements.
+- **Verification** checks whether each declared requirement — serialization, ordering, idempotency, recoverability — follows from the declared facts. Verdicts are `proven`, `unknown`, or `disproven`. An `unknown` verdict means the verifier could not establish the property, not that it is false.
+
+<CardGroup cols={2}>
+  <Card title="Field Types" icon="brackets-curly" href="/dsl/field-types">
+    Scalar types, optional fields, list types, and schema definitions
+  </Card>
+  <Card title="Effects" icon="arrow-right-arrow-left" href="/dsl/effects">
+    Publication, request, and external effects
+  </Card>
+  <Card title="Program Control" icon="code-branch" href="/dsl/program-control">
+    Steps, decisions, terminals, and step locations
+  </Card>
+  <Card title="Value References" icon="link" href="/dsl/value-references">
+    ValueRef sources, field paths, and derivation
+  </Card>
+</CardGroup>

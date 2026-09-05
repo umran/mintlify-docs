@@ -1,0 +1,299 @@
+---
+title: "Transactions and Atomic Execution in Conseqa Models"
+sidebarTitle: "Transactions"
+description: "Transactions are atomic units inside operations. Learn isolation levels, step kinds, derivation, and how outputs and intents flow into program control."
+---
+
+A transaction is one atomic commit-or-abort unit inside an operation's program. When a program step executes a transaction, all of its steps commit together or not at all. Transactions are the boundary through which the verifier reasons about isolation, deduplication, and artifact production. Declaring a transaction inside an operation does not execute it — execution happens only when a program step references it.
+
+## Transaction fields
+
+Every transaction declares the following:
+
+| Field | Purpose |
+|---|---|
+| `data_model` | The logical transactional state boundary this transaction operates against |
+| `isolation` | The isolation level provided by the execution environment |
+| `idempotency` | Whether the environment provides keyed commit deduplication |
+| `steps` | The ordered sequence of logical operations inside the transaction |
+
+```yaml
+transactions:
+  tx.create_order.new:
+    data_model: data.checkout
+    isolation: read_committed
+    idempotency:
+      kind: deduplicated_by
+      key:
+        components:
+          - source: input:input.create_order.request
+            path: idempotency_key
+    steps:
+      - kind: insert
+        object: object.order
+        values:
+          kind: deterministic
+          from:
+            - source: input:input.create_order.request
+              path: order_id
+            - source: input:input.create_order.request
+              path: amount
+```
+
+### `data_model`
+
+Set `data_model` to a declared data model ID when the transaction reads or writes persistent objects. Set it to `null` only when the transaction performs no application object access and exists solely to produce or consume framework artifacts (transaction outputs and effect intents). Never use `null` to imply object access without a declared transactional boundary.
+
+### Isolation
+
+The isolation level is an implementation guarantee provided by the execution environment:
+
+| Value | Semantics |
+|---|---|
+| `unspecified` | No isolation fact may be assumed |
+| `read_committed` | Reads do not observe uncommitted writes; non-repeatable reads and read/modify/write races remain possible |
+| `snapshot` | Reads come from a consistent committed snapshot; write skew and predicate-level anomalies remain possible |
+| `serializable` | Committed transactions admit an equivalent serial execution order |
+
+<Warning>
+`serializable` means transaction serializability only. It does not imply real-time object-history precedence (linearizability) and must not be promoted into an object-history guarantee. No verifier draws that inference.
+</Warning>
+
+### Transaction idempotency
+
+The `idempotency` field declares whether the execution environment provides durable keyed commit deduplication for this transaction:
+
+| Value | Meaning |
+|---|---|
+| `unspecified` | No explicit deduplication fact; the verifier may still prove natural replayability |
+| `not_deduplicated` | Explicitly declares no keyed deduplication; natural replayability still provable |
+| `deduplicated_by { key }` | The environment guarantees `Commit(T,K)` semantics for this key |
+
+**`deduplicated_by`** is the key mechanism for safe retries. When the execution environment sees the same `(transaction, key)` pair again, it resolves the prior commit and restores any artifacts that committed with it — rather than running the transaction body again. This makes the transaction safe across retries and lets the verifier prove that artifacts produced by the first commit are available on every subsequent attempt.
+
+## Transaction step kinds
+
+Steps are declared as an ordered list inside `steps`. The step order represents logical program order, which matters for lock-order analysis, transaction-read provenance, and artifact availability.
+
+<Accordion title="read">
+Reads fields from one or more objects matching a selector and binds the result to a transaction-local ID.
+
+```yaml
+- kind: read
+  result: read.reserve_inventory.stock
+  target:
+    object: object.stock
+    predicate:
+      kind: and
+      predicates:
+        - kind: eq
+          field: warehouse_id
+          value:
+            source: input:input.reserve_inventory.created
+            path: warehouse_id
+        - kind: eq
+          field: sku
+          value:
+            source: input:input.reserve_inventory.created
+            path: sku
+  fields:
+    kind: only
+    fields:
+      - on_hand
+      - reserved
+```
+
+`fields` accepts `kind: all` to read every field, or `kind: only` with a list. The result is accessible within the same transaction through `transaction_read:<result-id>` value references. It is **not** available outside the transaction — export it through an `establish_transaction_output` step to use it in later program steps.
+</Accordion>
+
+<Accordion title="write">
+Writes fields to objects matching a selector. Declares the provenance of the written values through a derivation.
+
+```yaml
+- kind: write
+  target:
+    object: object.stock
+    predicate:
+      kind: eq
+      field: warehouse_id
+      value:
+        source: input:input.reserve_inventory.created
+        path: warehouse_id
+  fields:
+    - reserved
+  values:
+    kind: deterministic
+    from:
+      - source: transaction_read:read.reserve_inventory.stock
+        path: reserved
+      - source: input:input.reserve_inventory.created
+        path: quantity
+```
+</Accordion>
+
+<Accordion title="insert">
+Inserts a new object instance. The object's identity fields come from the declared values derivation; you do not redeclare them separately. Insertion respects the object's `identity` uniqueness constraint.
+
+```yaml
+- kind: insert
+  object: object.order
+  values:
+    kind: deterministic
+    from:
+      - source: input:input.create_order.request
+        path: order_id
+      - source: input:input.create_order.request
+        path: amount
+```
+</Accordion>
+
+<Accordion title="delete">
+Deletes objects matching a selector.
+
+```yaml
+- kind: delete
+  target:
+    object: object.order
+    predicate:
+      kind: eq
+      field: order_id
+      value:
+        source: input:input.cancel_order.request
+        path: order_id
+```
+</Accordion>
+
+<Accordion title="lock">
+Acquires a `shared` or `exclusive` lock on objects matching a selector. Declares an optional ordering to help lock-order and deadlock analysis.
+
+```yaml
+- kind: lock
+  target:
+    object: object.stock
+    predicate:
+      kind: eq
+      field: warehouse_id
+      value:
+        source: input:input.transfer_stock.request
+        path: source_warehouse_id
+  mode: exclusive
+  order:
+    kind: unspecified
+```
+
+Lock steps appear in program order; concurrent transactions attempting to acquire the same lock in different orders may deadlock. Use a consistent field-based ordering where you need to model multiple locks in one transaction.
+</Accordion>
+
+<Accordion title="transition">
+Applies a state machine transition to a persistent object. See [State Machines](/concepts/state-machines) for full details. A transition step also declares `effect_values` — one value derivation per side effect declared on the transition.
+
+```yaml
+- kind: transition
+  machine: machine.order_lifecycle
+  transition: transition.order.cancel
+  subject:
+    object: object.order
+    predicate:
+      kind: eq
+      field: order_id
+      value:
+        source: input:input.cancel_order.request
+        path: order_id
+  effect_values: {}
+```
+</Accordion>
+
+<Accordion title="establish_effect_intent">
+Establishes an effect intent artifact atomically with the transaction commit. The intent captures the specific effect instance — its payload values, fixed by the `values` derivation at this step — so the intent is recoverable after a crash without re-deriving the payload.
+
+```yaml
+- kind: establish_effect_intent
+  intent: intent.create_order.publish_created
+  values:
+    kind: deterministic
+    from:
+      - source: input:input.create_order.request
+        path: order_id
+      - source: input:input.create_order.request
+        path: idempotency_key
+      - source: input:input.create_order.request
+        path: warehouse_id
+```
+</Accordion>
+
+<Accordion title="establish_transaction_output">
+Exports a typed value from the transaction into the enclosing operation's control. The output is available to program steps after the transaction executes or recovers.
+
+```yaml
+- kind: establish_transaction_output
+  output: output.create_order
+  values:
+    kind: deterministic
+    from:
+      - source: input:input.create_order.request
+        path: order_id
+```
+</Accordion>
+
+## Object selectors
+
+Steps that target objects use a selector to identify which instances to act on:
+
+| Predicate | Example |
+|---|---|
+| `all` | Matches every instance of the object type |
+| `eq { field, value }` | Matches instances where `field` equals `value` |
+| `and { predicates }` | All nested predicates must hold |
+
+`value` in an `eq` predicate can be a value reference (a map with `source` and `path`) or a literal scalar (a plain string, bool, or integer).
+
+## Derivation
+
+`values` in write, insert, establish-intent, and establish-output steps declares how the written or exported value is computed:
+
+| Kind | Meaning |
+|---|---|
+| `unspecified` | Provenance is unknown; the verifier cannot prove replay-determinism from this |
+| `deterministic { from: [...] }` | The value is a deterministic function solely of the listed source value references |
+
+`deterministic` does not assert that the source values are replay-stable. The verifier separately determines whether each source is stable relative to the governing key. A derivation is **replay-deterministic** only when it is `deterministic` and every source is replay-stable.
+
+```yaml
+values:
+  kind: deterministic
+  from:
+    - source: input:input.create_order.request
+      path: order_id
+    - source: input:input.create_order.request
+      path: amount
+```
+
+## Transaction outputs and operation control flow
+
+Information observed inside a transaction (through a `read` step) is transaction-local and does not escape automatically. To use a read result in later program steps — a branch condition, an effect derivation, a terminal result — you must export it explicitly through `establish_transaction_output`.
+
+```text
+transaction-local read result
+         |
+         | establish_transaction_output
+         v
+operation-visible transaction output
+         |
+         | program steps can now reference it
+         v
+effect derivation, branch condition, return outcome
+```
+
+A transaction output does not imply a database row, a response, or idempotency. Establishing an output does not prevent the transaction from executing again — only `deduplicated_by` prevents that.
+
+## Artifact replay
+
+When a crash occurs between a transaction commit and a later program step that depends on a transaction artifact (an output or an effect intent), the verifier must establish that the artifact is available on retry. There are two routes:
+
+**Route A — Reconstruction:** the establishing transaction is naturally replayable, and the artifact's derivation is replay-deterministic. A retry re-executes the transaction and reconstructs the same artifact without requiring it to have been separately stored.
+
+**Route B — Recovery:** the establishing transaction is `deduplicated_by { key }` with a replay-stable key. A retry encounters the prior `Commit(T,K)`, resolves it, and restores the exact artifacts from the first successful commit.
+
+<Tip>
+Use `deduplicated_by` on any transaction that establishes artifacts consumed by later program steps when those artifacts cannot be deterministically reconstructed (for example, when they depend on a `transaction_read` result, which cannot prove natural replayability in V1).
+</Tip>

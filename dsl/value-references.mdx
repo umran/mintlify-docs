@@ -1,0 +1,408 @@
+---
+title: "Value References, Field Paths, and Derivations DSL"
+sidebarTitle: "Value References"
+description: "Complete reference for ValueRef: seven source kinds, field paths, derivation forms, scope constraints, and how value references underpin keys and replay."
+---
+
+Value references (`ValueRef`) are how the Conseqa DSL declares where data comes from. You use them in requirement keys, idempotency key propagation, transaction commit keys, effect execution derivations, transaction output provenance, and branch conditions. Every value reference has two parts: a `source` that identifies the origin of the data, and a `path` that identifies a field within that source's schema.
+
+Value references describe data flow in a way the verifier can analyze. They do not compute values at runtime — they declare logical provenance so the verifier can determine whether derived values are stable across retries.
+
+## Structure of a value reference
+
+A `ValueRef` always has two fields:
+
+<ParamField path="source" type="ValueSource" required>
+  A qualified source identifier. Written either as a `kind:id` shorthand string or as a map with `kind` and `id` keys.
+</ParamField>
+
+<ParamField path="path" type="FieldPath" required>
+  A field path relative to the source's schema. Written as a dotted string (`order_id`, `customer.id`) or as a YAML sequence (`[customer, id]`). See [Field paths](#field-paths).
+</ParamField>
+
+<CodeGroup>
+```yaml Shorthand source (two-line form)
+- source: input:input.create_order.request
+  path: idempotency_key
+```
+
+```yaml Canonical source (map form)
+- source:
+    kind: input
+    id: input.create_order.request
+  path:
+    - idempotency_key
+```
+</CodeGroup>
+
+Both forms are semantically identical. The verifier always works with the canonical form; the shorthand is an authoring convenience. You must always write the kind — it is never inferred from the ID. The seven sources live in seven separate namespaces, and silently resolving an ambiguous ID would change the model's meaning.
+
+---
+
+## The seven source kinds
+
+### `input`
+
+References a field in the current invocation's input payload. Use this to read from the request body or subscription message that triggered the operation.
+
+```yaml
+- source: input:input.create_order.request
+  path: idempotency_key
+
+- source: input:input.reserve_inventory.created
+  path: order_id
+```
+
+An `input` reference is scoped to invocations of the declaring operation. You cannot reference another operation's input. The reference is observable from the moment the invocation begins, but it is not automatically replay-stable: whether a field is stable across retries depends on whether the input's declared identity pins it — see [Replay stability](#replay-stability).
+
+---
+
+### `effect`
+
+References a field in the payload of a declared `PublicationEffect` or `RequestEffect`. Use this in `idempotency_key_propagation` to name the target fields in the outbound payload.
+
+```yaml
+# In a publication effect's idempotency_key_propagation:
+- source: effect:effect.create_order.publish_created
+  path: event_id
+```
+
+An `effect` reference names a field in the declared schema of the effect's payload. It does not mean the effect has already executed — it establishes value lineage. External effects have no inspectable payload schema and cannot be referenced this way; their results are accessed through `effect_result_ok` or `effect_result_err` instead.
+
+---
+
+### `transaction_output`
+
+References a field of a transaction output: a typed value a transaction deliberately exported into the operation's control.
+
+```yaml
+- source: transaction_output:output.create_order
+  path: order_id
+
+- source: transaction_output:output.create_order
+  path: status
+```
+
+A `transaction_output` reference is valid only at program points where the output is **definitely available** — that is, established or recovered by a transaction on every path reaching the reference site. The verifier enforces this as a structural rule. How the value survives a retry depends on the establishing transaction: natural replayability (route A) or an explicit `deduplicated_by` commit (route B).
+
+<Note>
+  A `transaction_output` reference does not imply independent durable storage. The output's values reach a retry through reconstruction (naturally replayable transaction with a deterministic derivation) or recovery (keyed commit retaining the artifact). The source kind alone says nothing about which route applies.
+</Note>
+
+---
+
+### `state_machine_subject`
+
+References a field on the persistent object governed by the identified state machine subject.
+
+```yaml
+- source: state_machine_subject:machine.order_lifecycle
+  path: status
+```
+
+The path is resolved against the object's schema (the schema declared on the subject's `object`). `state_machine_subject` is **not scope-restricted** — any operation may reference any state machine's subject fields. However, mutable subject state is not automatically replay-stable. In V1, state machine subject fields are always treated as unknown for replay-stability purposes.
+
+---
+
+### `transaction_read`
+
+References a field observed by a named `read` step earlier in the **same transaction execution**. This source kind is restricted to the transaction that produced the read result.
+
+```yaml
+# Inside a transaction's steps:
+- kind: read
+  result: read.reserve_inventory.stock
+  target:
+    object: object.stock
+    predicate: ...
+  fields:
+    kind: only
+    fields: [on_hand, reserved]
+
+- kind: write
+  target: ...
+  values:
+    kind: deterministic
+    from:
+      - source: transaction_read:read.reserve_inventory.stock
+        path: reserved         # valid here — same transaction
+      - source: input:input.reserve_inventory.created
+        path: quantity
+```
+
+`transaction_read` results are transaction-local. They do not become available to later transactions or program steps, and they cannot be exported across the transaction boundary through a value reference alone — only through a `establish_transaction_output` step. In V1, a provenance chain that reaches a `transaction_read` also prevents natural transaction replayability.
+
+---
+
+### `effect_result_ok`
+
+References a field of the `Ok` payload of a bound effect result. Available **only inside the `ok` arm** of a `match_result` on that result binding.
+
+```yaml
+- kind: match_result
+  result: result.transcode_video.render
+  ok:
+    steps:
+      - kind: transaction
+        transaction: tx.transcode_video.complete  # this transaction uses the ok payload:
+```
+
+```yaml
+# Inside tx.transcode_video.complete's steps:
+- kind: write
+  target: ...
+  values:
+    kind: deterministic
+    from:
+      - source: effect_result_ok:result.transcode_video.render
+        path: manifest_uri   # valid — inside ok arm
+```
+
+The ID names the result binding declared at the `execute_effect` or `execute_effect_intent` step. The path resolves against the effect contract's `ok` schema. `effect_result_ok` is an operation-local observation — not a transaction artifact — and does not survive the join after the `match_result`.
+
+---
+
+### `effect_result_err`
+
+References a field of the `Err` payload of a bound effect result. Available **only inside the `err` arm** of a `match_result` on that result binding.
+
+```yaml
+  err:
+    steps:
+      - kind: execute_effect
+        effect: effect.charge_payment.publish_failed
+        values:
+          kind: deterministic
+          from:
+            - source: input:input.charge_payment.reserved
+              path: event_id
+            - source: input:input.charge_payment.reserved
+              path: order_id
+            - source: effect_result_err:result.charge_payment.card
+              path: reason   # valid — inside err arm
+```
+
+The path resolves against the effect contract's `err` schema. Like `effect_result_ok`, this source is arm-local and does not survive the join after the match.
+
+---
+
+## Source kinds at a glance
+
+| Source kind | What it references | Scope restriction |
+|---|---|---|
+| `input` | Current invocation's input payload | Declared inputs of the admitting operation |
+| `effect` | Payload field of a publication or request effect | Effects of the admitting operation (or its applied transitions) |
+| `transaction_output` | Field exported by a named transaction output | Definitely available at the reference site (forward analysis) |
+| `state_machine_subject` | Field on a persistent state machine object | None — unrestricted |
+| `transaction_read` | Field observed by a read step in the same transaction | The transaction that produced the read result |
+| `effect_result_ok` | Ok payload field of a bound result | Inside `ok` arm of a `match_result` on that binding |
+| `effect_result_err` | Err payload field of a bound result | Inside `err` arm of a `match_result` on that binding |
+
+---
+
+## Field paths
+
+A field path identifies a nested value relative to a source schema.
+
+<CodeGroup>
+```yaml Dotted shorthand
+path: customer.id
+```
+
+```yaml Sequence form
+path:
+  - customer
+  - id
+```
+</CodeGroup>
+
+Use the sequence form when a path component itself contains a dot. A single-component path for a top-level field may be written as a plain string without dots:
+
+```yaml
+path: order_id
+path: event_id
+```
+
+Diagnostics and error messages always render paths in dotted form (`customer.id`).
+
+---
+
+## Derivation
+
+A `Derivation` declares how values are produced. The DSL provides two forms:
+
+<ParamField path="kind: unspecified" type="Derivation">
+  The model provides no fact about how the values are produced. Always declare this explicitly — never omit the `values` field on a step.
+</ParamField>
+
+<ParamField path="kind: deterministic" type="Derivation">
+  The produced values are a deterministic function solely of the declared source values in `from`. This does **not** assert that those sources are replay-stable; replay stability is established separately by the verifier.
+</ParamField>
+
+```yaml
+values:
+  kind: unspecified
+
+values:
+  kind: deterministic
+  from:
+    - source: input:input.create_order.request
+      path: order_id
+    - source: input:input.create_order.request
+      path: amount
+```
+
+Derivation appears on:
+
+- `execute_effect` steps (`values` field)
+- `establish_effect_intent` transaction steps (`values` field)
+- `establish_transaction_output` transaction steps (`values` field)
+- `return` outcome (`outcome.values` field)
+- `transition` effect values (`effect_values` derivations)
+
+A `deterministic` derivation combined with replay-stable provenance roots produces a **replay-deterministic** value — one that is stable across retries within the same logical class.
+
+---
+
+## Replay stability
+
+The verifier determines whether each value reference is replay-stable relative to a governing key. A reference is stable if every attempt in the same logical class evaluates it to the same logical value.
+
+The V1 rules establish stability through these routes:
+
+1. **Key components** — every component of the governing key is replay-stable by definition (class membership requires equality).
+2. **Literals** — literal values in branch conditions are always stable.
+3. **Identified triggering payload** — when the triggering input declares a keyed identity whose fields are fully pinned by the governing key, every field of that input's payload is stable.
+4. **Recovered artifacts** — transaction outputs and effect intents established by a `deduplicated_by` transaction whose key components are all stable are stable (route B recovery).
+5. **Reconstructed artifacts** — transaction outputs and effect intents established by a naturally replayable transaction, with a replay-deterministic derivation, are stable (route A reconstruction).
+6. **Effect results** — `effect_result_ok`/`effect_result_err` references are stable per variant under specific conditions: for a request result, when the instance is class-fixed and the target proves `result: replay_consistent`; for a deduplicated external result, when the key is stable and the variant is terminal.
+7. **Congruence** — a value produced by `deterministic { from: [...] }` with all stable roots inherits stability.
+
+Everything else is treated as **unknown** by the verifier. Unknown does not mean unstable — it means the model provides no fact from which stability can be established.
+
+---
+
+## SelectorValue: literals and references in conditions
+
+Branch conditions use `SelectorValue` for the `equals` field of an `eq` condition. A `SelectorValue` is either:
+
+- a **plain scalar** — parsed as a literal value, which is always replay-stable;
+- a **map** — parsed as a `ValueRef`, referencing another modeled value.
+
+```yaml
+# Literal: equals a constant string
+condition:
+  kind: eq
+  value:
+    source: input:input.checkout
+    path: currency
+  equals: USD
+
+# Value reference: equals another field's value
+condition:
+  kind: eq
+  value:
+    source: input:input.checkout
+    path: order_id
+  equals:
+    source: transaction_output:output.pending_order
+    path: id
+```
+
+The verifier checks whether `equals` is stable using the same replay-stability rules. A branch whose `equals` is an unstable value reference is not established to replay, and is reported as an obstacle for idempotency and result-replay analysis.
+
+<Warning>
+  If a string value looks like a value-source shorthand (e.g. `input:something`) but you intend it as a literal, the parser will reject it as a malformed value reference. Use the canonical map form to write a value reference, and a plain string for a literal.
+</Warning>
+
+---
+
+## Real examples from the fixtures
+
+**Input references in an idempotency key:**
+
+```yaml
+# flash_checkout.yaml — create_order idempotency key
+idempotency:
+  - key:
+      components:
+        - source: input:input.create_order.request
+          path: idempotency_key
+    result: replay_consistent
+```
+
+**Transaction output reference in a return step:**
+
+```yaml
+# flash_checkout.yaml — create_order return
+- kind: return
+  request: input.create_order.request
+  outcome:
+    kind: ok
+    values:
+      kind: deterministic
+      from:
+        - source: transaction_output:output.create_order
+          path: order_id
+        - source: transaction_output:output.create_order
+          path: status
+```
+
+**`effect_result_err` inside a `match_result` err arm:**
+
+```yaml
+# flash_checkout.yaml — charge_payment err arm
+err:
+  steps:
+    - kind: execute_effect
+      effect: effect.charge_payment.publish_failed
+      values:
+        kind: deterministic
+        from:
+          - source: input:input.charge_payment.reserved
+            path: event_id
+          - source: input:input.charge_payment.reserved
+            path: order_id
+          - source: effect_result_err:result.charge_payment.card
+            path: reason
+```
+
+**`transaction_read` inside a transaction body:**
+
+```yaml
+# flash_checkout.yaml — reserve_inventory transaction
+- kind: write
+  target: ...
+  values:
+    kind: deterministic
+    from:
+      - source: transaction_read:read.reserve_inventory.stock
+        path: reserved
+      - source: input:input.reserve_inventory.created
+        path: quantity
+```
+
+**`effect_result_ok` inside a transaction's effect_values (video streaming):**
+
+```yaml
+# video_streaming.yaml — transcode_video complete transaction
+effect_values:
+  effect.job.completed:
+    kind: deterministic
+    from:
+      - source: input:input.transcode_video.uploaded
+        path: event_id
+      - source: input:input.transcode_video.uploaded
+        path: video_id
+      - source: effect_result_ok:result.transcode_video.render
+        path: manifest_uri
+```
+
+<CardGroup cols={2}>
+  <Card title="Effects" icon="arrow-right-arrow-left" href="/dsl/effects">
+    How value references are used in effect idempotency keys and propagation
+  </Card>
+  <Card title="Program Control" icon="code-branch" href="/dsl/program-control">
+    How derivations and conditions appear in program steps
+  </Card>
+</CardGroup>

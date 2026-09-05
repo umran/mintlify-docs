@@ -1,0 +1,60 @@
+---
+title: "State Machine View: Lifecycle Diagrams in conseqa-viz"
+sidebarTitle: "State Machine View"
+description: "Inspect any state machine as an interactive lifecycle diagram — states, transitions, side effects, and obligation verdicts — with shareable deep links."
+---
+
+The state machine view renders a visual lifecycle diagram for any declared state machine in your model. Navigate to it from an operation's header (when that operation drives the machine) or from the detail panel of any transition step in the [Operation View](/visualization/operation-view).
+
+## Navigation and deep links
+
+The state machine view lives at `#/machine/<id>`. To link directly to a specific transition — for example, to share a link pointing at the transition a failing obligation names — use `#/machine/<id>?t=<transition-id>`. Selecting a transition in the graph or table updates the URL, so any link you copy from the address bar is already a deep link.
+
+## Page header
+
+The header shows:
+
+- The machine's name and copyable ID
+- The **governed object** — the data object whose instances this machine tracks
+- The **state field path** — which field on that object holds the current state
+- The **initial state**
+- **State count** and **transition count**
+- **Verdict tally** — when a report is loaded, a count of proven/unknown/disproven obligations across all transitions
+
+## State graph
+
+The state graph is an SVG diagram with states as nodes and transitions as directed arcs:
+
+- **State nodes** are labeled circles. The initial state is marked with an entry arrow.
+- **Transition arcs** are directed edges connecting a `from` state to a `to` state. Transitions that stay on the same state render as self-loops.
+- **Side-effect badges** (⚡) appear on transition arcs to indicate the number of side effects the transition owns.
+
+Click any state node to open its detail panel. Click or select any transition arc to highlight it in both the graph and the transitions table below; the URL updates to include `?t=<transition-id>` for sharing. Clicking a state node without selecting a transition drops the transition query from the URL.
+
+## Transitions table
+
+Below the graph, the transitions table lists every declared transition with one row per transition:
+
+| Column | Contents |
+|---|---|
+| Transition | The transition ID, copyable |
+| From | The set of states the transition is legal from |
+| To | The target state |
+| Side effects | Each side effect, structured as kind, effect ID, and target (topic or operation) |
+| Executors | The operations that execute this transition's side effects via intents (with links) |
+| Triggers | The transaction steps that apply this transition (with links to the owning operation) |
+| Verdict | When a report is loaded, the obligation status for this transition's obligations |
+
+### Side effects and executors
+
+A transition's side effects are the publication or request effects it owns. These effects are not executed by the transition itself — they are established as effect intents inside the transaction that applies the transition, then executed by an `execute_effect_intent` step later in the operation's program. The **Executors** column shows which operations apply this transition and therefore carry responsibility for executing its side effects.
+
+Click any operation name in the Executors column to navigate to that operation's [Operation View](/visualization/operation-view).
+
+## Proof overlays
+
+When a report is loaded, transitions inherit their proof status. A transition whose associated obligations are all proven shows a green verdict chip; any unknown obligation turns it amber; any disproven obligation turns it red. This makes it easy to scan the transitions table for the specific lifecycle steps the checker could not discharge.
+
+<Tip>
+Use the `?t=<transition-id>` deep link when filing a bug or design discussion. The link opens the machine view with the specific transition pre-selected in both the graph and the table, so your reader lands exactly where you intend.
+</Tip>

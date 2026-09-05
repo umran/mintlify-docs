@@ -1,0 +1,184 @@
+---
+title: "Anatomy of a Conseqa Model: Structure and Sections"
+sidebarTitle: "Model Overview"
+description: "A Conseqa model is a YAML file with seven required top-level keys that together describe one snapshot of your distributed architecture."
+---
+
+A Conseqa model is a YAML file that describes a snapshot of your distributed architecture. You write it once, run `conseqa model.yaml`, and the verification engine statically checks whether the correctness properties you declared actually follow from the architecture you described. The model is not executable code, a deployment manifest, or a configuration file — it is a logical description from which the verifier reasons.
+
+Every model has the same seven required top-level keys. Each plays a distinct role, and none of them imply runtime behavior on their own.
+
+## Top-level sections
+
+### `revision`
+
+`revision` is an opaque numeric marker you increment when the model changes. Conseqa assigns no compatibility, ordering, or migration semantics to it — it is purely a tracking identifier.
+
+```yaml
+revision: 1
+```
+
+### `services`
+
+`services` declares the logical ownership boundaries in your system. Every operation belongs to exactly one service. Services are descriptive groupings only; they imply no process boundary, network hop, or trust boundary. See [Services & Schemas](/concepts/services-and-schemas) for the four available service kinds.
+
+```yaml
+services:
+  service.checkout:
+    kind: backend
+  service.payments:
+    kind: worker
+```
+
+### `schemas`
+
+`schemas` declares the logical value shapes used throughout the model — request payloads, event messages, data object states, and response types. There are two kinds: `canonical` schemas define a shape directly; `fragment` schemas project fields from a canonical schema. See [Services & Schemas](/concepts/services-and-schemas) for full field-type syntax.
+
+```yaml
+schemas:
+  schema.OrderCreated:
+    kind: canonical
+    completeness: complete
+    fields:
+      event_id: string
+      order_id: uuid
+      quantity: int
+```
+
+### `data_models`
+
+`data_models` declares the logical transactional state boundaries in your system. Each data model contains one or more `DataObject` declarations — persistent entities with a canonical schema and a composite identity. Transactions in operations reference a data model to declare which shared transactional boundary they operate against.
+
+```yaml
+data_models:
+  data.checkout:
+    objects:
+      object.order:
+        schema: schema.OrderRecord
+        identity:
+          - order_id
+```
+
+### `topics`
+
+`topics` declares the message channels that operations publish to and subscribe from. A topic declares which schemas it carries, what ordering guarantee it provides, and whether messages have a declared identity. See [Topics & Messaging](/concepts/topics-and-messaging).
+
+```yaml
+topics:
+  topic.order_events:
+    messages:
+      - schema.OrderCreated
+    ordering:
+      kind: keyed
+      mapping:
+        schema.OrderCreated: order_id
+    message_identity:
+      kind: unspecified
+```
+
+### `state_machines`
+
+`state_machines` declares persistent state-transition graphs over data objects. A state machine names a subject object, an enumerated set of states, an initial state, and a set of transitions (each with optional publication or request side effects). Transitions fire inside operation transactions. See [State Machines](/concepts/state-machines).
+
+```yaml
+state_machines:
+  machine.order_lifecycle:
+    subject:
+      kind: object
+      object: object.order
+      state: status
+    states:
+      - state.order.pending
+      - state.order.paid
+      - state.order.cancelled
+    initial: state.order.pending
+    transitions:
+      transition.order.cancel:
+        from:
+          - state.order.pending
+        to: state.order.cancelled
+        side_effects: {}
+```
+
+### `operations`
+
+`operations` is the main section. Each operation declares a logical unit of behavior: its owning service, possible inputs (synchronous requests or topic subscriptions), effects (publications, requests to other services, or external calls), transactions, a program that wires everything together with explicit control flow, and correctness requirements. See [Operations](/concepts/operations) and [Requirements](/concepts/requirements).
+
+## Minimal model skeleton
+
+The following model satisfies the structural contract with all sections present. Use it as a starting point before filling in your own services, schemas, and operations.
+
+```yaml
+revision: 1
+
+services:
+  checkout:
+    kind: backend
+
+schemas:
+  OrderCreated:
+    kind: canonical
+    description: An order accepted by checkout.
+    completeness: complete
+    fields:
+      order_id: uuid
+      quantity: int
+
+data_models: {}
+
+topics:
+  order_events:
+    messages:
+      - OrderCreated
+    ordering:
+      kind: unordered
+    message_identity:
+      kind: unspecified
+
+state_machines: {}
+
+operations: {}
+```
+
+<Note>
+All seven top-level keys must be present. The six map sections (`services`, `schemas`, `data_models`, `topics`, `state_machines`, `operations`) may be empty (`{}`); `revision` must be a numeric value. Omitting any key is a validation error.
+</Note>
+
+## Three semantic categories
+
+Every declaration in a Conseqa model belongs to one of three categories. Understanding the distinction is essential for reading verification results correctly.
+
+| Category | What it means | Examples |
+|---|---|---|
+| **Structural fact** | Describes what the modeled system can do or how entities relate | operations, transactions, schemas, effects |
+| **Implementation guarantee** | A fact the model claims the implementation provides; the verifier may rely on it | topic ordering, delivery semantics, transaction isolation, deduplication keys |
+| **Requirement / obligation** | A property that must hold; declaring it does NOT assert it is already satisfied | serialization, ordering, idempotency, recoverability |
+
+A structurally valid model is not necessarily a correct model. Validation checks coherence; verification checks whether declared requirements follow from declared facts.
+
+## What `unspecified` means
+
+Throughout the model, `unspecified` means: *the model provides no fact from which this property may be inferred*. It does not mean the property is false, and it does not permit a violation. It means the verifier must treat the value as unknown and cannot use it as evidence for a proof.
+
+## Explore the concepts
+
+<CardGroup cols={2}>
+  <Card title="Services & Schemas" icon="layer-group" href="/concepts/services-and-schemas">
+    Service kinds, canonical and fragment schemas, field types, and data models
+  </Card>
+  <Card title="Operations" icon="bolt" href="/concepts/operations">
+    Inputs, effects, transactions, programs, and execution concurrency
+  </Card>
+  <Card title="Transactions" icon="database" href="/concepts/transactions">
+    Atomic execution, isolation, step kinds, and transaction outputs
+  </Card>
+  <Card title="Topics & Messaging" icon="envelope" href="/concepts/topics-and-messaging">
+    Message channels, ordering guarantees, delivery semantics, and dispatch
+  </Card>
+  <Card title="State Machines" icon="diagram-project" href="/concepts/state-machines">
+    Persistent state transitions, side effects, and lifecycle modeling
+  </Card>
+  <Card title="Requirements" icon="shield-check" href="/concepts/requirements">
+    Serialization, ordering, idempotency, and recoverability obligations
+  </Card>
+</CardGroup>

@@ -1,0 +1,394 @@
+---
+title: "Step-by-Step: Modeling a Flash-Sale Checkout in Conseqa"
+sidebarTitle: "Checkout Flow"
+description: "Build a Conseqa model for a flash-sale checkout service step by step, then run the verifier and interpret its 10 proven and 4 unknown obligations."
+---
+
+This guide walks through the `flash_checkout.yaml` fixture — a realistic checkout service covering order creation, inventory reservation, payment charging, and payment application. By the end you will have a working model, understand every section of the YAML, and know how to interpret the verifier's output, including the four deliberate gaps the model leaves open.
+
+## What you are modeling
+
+The checkout pipeline moves an order through four services:
+
+1. **checkout** (`create_order`) — creates an order record and publishes `OrderCreated`
+2. **inventory** (`reserve_inventory`) — listens for `OrderCreated` and reserves stock
+3. **payments** (`charge_payment`) — listens for `InventoryReserved` and charges the card
+4. **checkout** (`apply_payment`) — listens for `PaymentCaptured` and marks the order paid
+
+All hand-offs flow through a single keyed topic, `topic.order_events`, ordered and identified by `order_id` and `event_id` respectively.
+
+## Step 1 — Declare services
+
+Start your model file with a revision and the three owning services:
+
+```yaml
+revision: 1
+services:
+  service.checkout:
+    kind: backend
+  service.inventory:
+    kind: backend
+  service.payments:
+    kind: worker
+```
+
+Service kinds (`backend`, `worker`, `frontend`, `job`) are descriptive only — they do not imply process boundaries, trust boundaries, or availability guarantees. Use them for human clarity in the visualization.
+
+## Step 2 — Declare schemas
+
+Every message and request payload needs a declared schema. The checkout flow uses canonical schemas with `completeness: complete`, meaning the verifier may treat undeclared fields as absent:
+
+```yaml
+schemas:
+  schema.CreateOrderRequest:
+    kind: canonical
+    completeness: complete
+    fields:
+      idempotency_key: string
+      order_id: uuid
+      warehouse_id: uuid
+      sku: string
+      quantity: int
+      amount: decimal
+  schema.CreateOrderResponse:
+    kind: canonical
+    completeness: complete
+    fields:
+      order_id: uuid
+      status: string
+  schema.OrderCreated:
+    kind: canonical
+    completeness: complete
+    fields:
+      event_id: string
+      order_id: uuid
+      warehouse_id: uuid
+      sku: string
+      quantity: int
+      amount: decimal
+  schema.InventoryReserved:
+    kind: canonical
+    completeness: complete
+    fields:
+      event_id: string
+      order_id: uuid
+      warehouse_id: uuid
+      sku: string
+      quantity: int
+      amount: decimal
+```
+
+The `event_id` field on each event schema is what enables message identity on the topic. Without it you cannot declare a keyed message identity, and without that the verifier cannot establish that duplicate deliveries carry the same logical message.
+
+## Step 3 — Declare data models and objects
+
+Persistent state lives in data models. The checkout flow has two:
+
+```yaml
+data_models:
+  data.checkout:
+    objects:
+      object.order:
+        schema: schema.OrderRecord
+        identity:
+          - order_id
+  data.inventory:
+    objects:
+      object.stock:
+        schema: schema.StockRecord
+        identity:
+          - warehouse_id
+          - sku
+```
+
+`object.stock` has a composite identity of `(warehouse_id, sku)` — two fields together identify one stock record. The identity declaration is what makes selector precision, uniqueness, and locking analysis meaningful.
+
+## Step 4 — Declare the topic
+
+The order events topic carries six message schemas, all keyed by `order_id` for ordering and by `event_id` for message identity:
+
+```yaml
+topics:
+  topic.order_events:
+    messages:
+      - schema.InventoryReserved
+      - schema.OrderCancelled
+      - schema.OrderCreated
+      - schema.OrderPaid
+      - schema.PaymentCaptured
+      - schema.PaymentFailed
+    ordering:
+      kind: keyed
+      mapping:
+        schema.InventoryReserved: order_id
+        schema.OrderCancelled: order_id
+        schema.OrderCreated: order_id
+        schema.OrderPaid: order_id
+        schema.PaymentCaptured: order_id
+        schema.PaymentFailed: order_id
+    message_identity:
+      kind: keyed
+      mapping:
+        schema.InventoryReserved:
+          - event_id
+        schema.OrderCancelled:
+          - event_id
+        schema.OrderCreated:
+          - event_id
+        schema.OrderPaid:
+          - event_id
+        schema.PaymentCaptured:
+          - event_id
+        schema.PaymentFailed:
+          - event_id
+```
+
+The `ordering` mapping says that messages with the same `order_id` are delivered in order within a key. The `message_identity` mapping says that two messages of the same schema with equal `event_id` values are the same logical message — which is what allows the verifier to reason about duplicate deliveries. Every schema carried by the topic must be covered for the verifier to establish that duplicate deliveries are safe across all admitted message types.
+
+## Step 5 — Model `create_order`
+
+`create_order` is a request-driven operation. It inserts an order record, establishes a publication intent, and returns the new order's ID:
+
+```yaml
+operations:
+  operation.create_order:
+    service: service.checkout
+    inputs:
+      input.create_order.request:
+        kind: request
+        schema: schema.CreateOrderRequest
+        identity:
+          kind: keyed
+          fields:
+            - idempotency_key
+        result:
+          ok: schema.CreateOrderResponse
+          err: schema.RequestRejected
+    effects:
+      effect.create_order.publish_created:
+        kind: publication
+        topic: topic.order_events
+        schema: schema.OrderCreated
+        idempotency_key_propagation:
+          - source:
+              components:
+                - source: input:input.create_order.request
+                  path: idempotency_key
+            target:
+              components:
+                - source: effect:effect.create_order.publish_created
+                  path: event_id
+    effect_intents:
+      intent.create_order.publish_created:
+        effect: effect.create_order.publish_created
+    transaction_outputs:
+      output.create_order:
+        schema: schema.CreateOrderResponse
+    transactions:
+      tx.create_order.new:
+        data_model: data.checkout
+        isolation: read_committed
+        idempotency:
+          kind: deduplicated_by
+          key:
+            components:
+              - source: input:input.create_order.request
+                path: idempotency_key
+        steps:
+          - kind: insert
+            object: object.order
+            values:
+              kind: deterministic
+              from:
+                - source: input:input.create_order.request
+                  path: order_id
+                - source: input:input.create_order.request
+                  path: amount
+          - kind: establish_effect_intent
+            intent: intent.create_order.publish_created
+            values:
+              kind: deterministic
+              from:
+                - source: input:input.create_order.request
+                  path: order_id
+                - source: input:input.create_order.request
+                  path: idempotency_key
+          - kind: establish_transaction_output
+            output: output.create_order
+            values:
+              kind: deterministic
+              from:
+                - source: input:input.create_order.request
+                  path: order_id
+    program:
+      steps:
+        - kind: transaction
+          transaction: tx.create_order.new
+        - kind: execute_effect_intent
+          intent: intent.create_order.publish_created
+        - kind: return
+          request: input.create_order.request
+          outcome:
+            kind: ok
+            values:
+              kind: deterministic
+              from:
+                - source: transaction_output:output.create_order
+                  path: order_id
+                - source: transaction_output:output.create_order
+                  path: status
+    requirements:
+      idempotency:
+        - key:
+            components:
+              - source: input:input.create_order.request
+                path: idempotency_key
+          result: replay_consistent
+      recoverability:
+        - key:
+            components:
+              - source: input:input.create_order.request
+                path: idempotency_key
+          completion: resumable
+```
+
+Several things are working together here:
+
+- `tx.create_order.new` is `deduplicated_by` the request's `idempotency_key`. This means a second attempt under the same key resolves the prior commit instead of inserting a duplicate order and re-establishing the intent.
+- The `effect_intent` captures the publication payload atomically with the transaction commit. Even if the process crashes between the commit and the publication step, a retry recovers the intent from the keyed commit and executes it.
+- `idempotency_key_propagation` on the publication effect declares that the downstream `event_id` carries the same logical identity as the upstream `idempotency_key`. This lineage is what lets the verifier trace the idempotency class from `create_order` through to `reserve_inventory`.
+
+## Step 6 — Model `reserve_inventory`
+
+`reserve_inventory` subscribes to `OrderCreated` events, reads the current stock, and writes a reservation. Notice the deliberate gap:
+
+```yaml
+  operation.reserve_inventory:
+    service: service.inventory
+    inputs:
+      input.reserve_inventory.created:
+        kind: subscription
+        topic: topic.order_events
+        messages:
+          kind: only
+          schemas:
+            - schema.OrderCreated
+        delivery: at_least_once
+        dispatch:
+          routing: by_topic_key
+          lane_concurrency:
+            kind: bounded
+            value: 1
+    transactions:
+      tx.reserve_inventory:
+        data_model: data.inventory
+        isolation: read_committed
+        idempotency:
+          kind: not_deduplicated
+        steps:
+          - kind: read
+            result: read.reserve_inventory.stock
+            target:
+              object: object.stock
+              predicate:
+                kind: and
+                predicates:
+                  - kind: eq
+                    field: warehouse_id
+                    value:
+                      source: input:input.reserve_inventory.created
+                      path: warehouse_id
+                  - kind: eq
+                    field: sku
+                    value:
+                      source: input:input.reserve_inventory.created
+                      path: sku
+            fields:
+              kind: only
+              fields:
+                - on_hand
+                - reserved
+          - kind: write
+            target:
+              object: object.stock
+              predicate:
+                kind: and
+                predicates:
+                  - kind: eq
+                    field: warehouse_id
+                    value:
+                      source: input:input.reserve_inventory.created
+                      path: warehouse_id
+            values:
+              kind: deterministic
+              from:
+                - source: transaction_read:read.reserve_inventory.stock
+                  path: reserved
+                - source: input:input.reserve_inventory.created
+                  path: quantity
+```
+
+`tx.reserve_inventory` is explicitly `not_deduplicated`. Its write value derives from a `transaction_read` result, and transaction-read results are never replay-stable. Both facts together mean the verifier cannot prove the transaction is retry-safe by either route.
+
+## Step 7 — Run the verifier
+
+With your model file complete, run:
+
+```bash
+conseqa flash_checkout.yaml
+```
+
+You will see an obligation summary with **10 proven** and **4 unknown**:
+
+```
+operation.apply_payment    serialization  proven
+operation.apply_payment    ordering       proven
+operation.apply_payment    idempotency    proven
+operation.apply_payment    recoverability proven
+operation.charge_payment   serialization  proven
+operation.charge_payment   ordering       proven
+operation.charge_payment   idempotency    unknown
+operation.create_order     idempotency    unknown
+operation.create_order     result_replay  proven
+operation.create_order     recoverability proven
+operation.reserve_inventory serialization proven
+operation.reserve_inventory ordering      proven
+operation.reserve_inventory idempotency   unknown
+operation.reserve_inventory recoverability unknown
+```
+
+## Understanding the four unknown obligations
+
+The four unknown obligations form a cascade rooted in `tx.reserve_inventory`:
+
+<Accordion title="reserve_inventory — idempotency: unknown">
+`tx.reserve_inventory` is `not_deduplicated` and its write value derives from a `transaction_read` result. Transaction reads are never replay-stable, so the transaction is not provably retry-safe by either route. A duplicate delivery re-drives the full program and re-encounters the transaction, which may reserve stock a second time. The published `InventoryReserved` event is also tied to a non-replay-stable intent, so the downstream consumer (`charge_payment`) may receive a second payment trigger.
+</Accordion>
+
+<Accordion title="reserve_inventory — recoverability: unknown">
+The same root cause. If the process crashes after `tx.reserve_inventory` commits, a resumed attempt re-encounters the transaction, which cannot resolve via a keyed commit (not deduplicated) and cannot reconstruct naturally (read-dependent write). There is no path back to a terminal.
+</Accordion>
+
+<Accordion title="charge_payment — idempotency: unknown">
+Two independent obstacles. First, `effect.charge_payment.card` is `not_deduplicated` — the payment provider does not guarantee deduplication, so a duplicate execution is distinguishable duplicate work. Second, the `match_result` on the card charge result at step 2 branches on a result that is not replay-stable, meaning a retry may take the `ok` arm when the original took `err`, or vice versa, potentially publishing a different outcome event.
+</Accordion>
+
+<Accordion title="create_order — idempotency: unknown">
+`create_order` publishes `OrderCreated` to `topic.order_events`, which `reserve_inventory` consumes. Because `reserve_inventory`'s idempotency is not proven, the cascade from a duplicate `OrderCreated` delivery is not established to collapse. The verifier traces work transitively — `create_order`'s idempotency can only be proven if every downstream consumer's idempotency is also proven.
+</Accordion>
+
+<Note>
+`unknown` is an epistemic verdict: the checker could not establish the property, typically because a required fact is absent or unspecified. It is never evidence of a violation. The implementation may be safe — the verifier simply cannot confirm it from the declared facts.
+</Note>
+
+## Generate the visualization
+
+Generate an HTML visualization with the proof overlay:
+
+```bash
+conseqa-viz flash_checkout.yaml --verify --out checkout.html
+```
+
+Open `checkout.html` in your browser. The system view will show the four unknown obligations highlighted in amber on the relevant operation nodes. Double-click `reserve_inventory` to see the exact step and transaction the checker could not discharge.
+
+To fix the unknown obligations, you would need to either add `deduplicated_by` to `tx.reserve_inventory` (with a stable key) or restructure the write to avoid depending on a transaction-read result. The card charge gap requires the payment provider to declare deduplication semantics, and the result disposition to be declared `terminal` on the `err` variant.

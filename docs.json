@@ -1,0 +1,97 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "name": "Conseqa",
+  "theme": "aspen",
+  "colors": {
+    "primary": "#5B4FCF",
+    "light": "#EDE9FF",
+    "dark": "#2D2460"
+  },
+  "favicon": "/favicon.svg",
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  },
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/umran/conseqa"
+    }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/model-overview",
+              "concepts/services-and-schemas",
+              "concepts/operations",
+              "concepts/transactions",
+              "concepts/topics-and-messaging",
+              "concepts/state-machines",
+              "concepts/requirements"
+            ]
+          },
+          {
+            "group": "DSL Reference",
+            "pages": [
+              "dsl/model-structure",
+              "dsl/field-types",
+              "dsl/effects",
+              "dsl/program-control",
+              "dsl/value-references"
+            ]
+          },
+          {
+            "group": "Verification",
+            "pages": [
+              "verification/how-it-works",
+              "verification/verdicts",
+              "verification/obligations-report"
+            ]
+          },
+          {
+            "group": "Visualization",
+            "pages": [
+              "visualization/overview",
+              "visualization/system-view",
+              "visualization/operation-view",
+              "visualization/state-machine-view"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/modeling-a-checkout-flow",
+              "guides/proving-idempotency",
+              "guides/ci-integration"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "CLI Reference",
+        "groups": [
+          {
+            "group": "Commands",
+            "pages": [
+              "cli/conseqa",
+              "cli/conseqa-viz"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

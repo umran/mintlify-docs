@@ -1,0 +1,109 @@
+{
+  "projectType": "cli-tool",
+  "projectName": "Conseqa",
+  "projectDescription": "A formal model checker for distributed systems that uses a YAML-based DSL to describe microservice architectures and statically verifies cross-component correctness properties such as ordering, serialization, idempotency, and recoverability.",
+  "theme": "aspen",
+  "primaryColor": "#5B4FCF",
+  "lightColor": "#EDE9FF",
+  "darkColor": "#2D2460",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/model-overview",
+              "concepts/services-and-schemas",
+              "concepts/operations",
+              "concepts/transactions",
+              "concepts/topics-and-messaging",
+              "concepts/state-machines",
+              "concepts/requirements"
+            ]
+          },
+          {
+            "group": "DSL Reference",
+            "pages": [
+              "dsl/model-structure",
+              "dsl/field-types",
+              "dsl/effects",
+              "dsl/program-control",
+              "dsl/value-references"
+            ]
+          },
+          {
+            "group": "Verification",
+            "pages": [
+              "verification/how-it-works",
+              "verification/verdicts",
+              "verification/obligations-report"
+            ]
+          },
+          {
+            "group": "Visualization",
+            "pages": [
+              "visualization/overview",
+              "visualization/system-view",
+              "visualization/operation-view",
+              "visualization/state-machine-view"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/modeling-a-checkout-flow",
+              "guides/proving-idempotency",
+              "guides/ci-integration"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "CLI Reference",
+        "groups": [
+          {
+            "group": "Commands",
+            "pages": [
+              "cli/conseqa",
+              "cli/conseqa-viz"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "YAML-based DSL for modeling microservice architectures (services, schemas, topics, operations, state machines, data models)",
+    "Static verification of correctness properties: serialization, ordering, idempotency, recoverability, and result-replay consistency",
+    "Epistemic proof verdicts — proven, unknown, or disproven — with detailed evidence and assumptions",
+    "Interactive single-file HTML visualization of the architecture graph and obligation results",
+    "Coinductive (greatest-fixpoint) analysis for mutually dependent requirements across cascading operations",
+    "Formal distinction between unspecified (unknown) and explicitly negative guarantees",
+    "CLI-driven workflow: validate a model, run the verifier, and export a JSON prover report",
+    "Embeddable Rust library API for programmatic model parsing, validation, and verification"
+  ],
+  "publicApiSurface": [
+    "CLI: conseqa <MODEL.yaml> [--report <PATH>]",
+    "CLI: conseqa-viz <MODEL.yaml> [--out <PATH>] [--report <PATH>] [--verify] [--json] [--title <TITLE>] [--example-report] [--no-validate]",
+    "Rust lib: conseqa::parser::yaml::parse(source: &str) -> Result<Model, serde_yaml::Error>",
+    "Rust lib: conseqa::parser::yaml::serialize(model: &Model) -> Result<String, serde_yaml::Error>",
+    "Rust lib: conseqa::analyzer::validate(model: &Model) -> Vec<ValidationError>",
+    "Rust lib: conseqa::analyzer::verification::verify(model: &Model) -> VerificationReport",
+    "Rust lib: conseqa::analyzer::report::obligations(model, verification) -> ProverReport",
+    "Rust lib: conseqa::analyzer::report::scaffold(model) -> ProverReport",
+    "DSL top-level keys: revision, services, schemas, data_models, topics, state_machines, operations",
+    "Requirement kinds: serialization, ordering, idempotency (with result_replay), recoverability",
+    "Verdict statuses: proven, unknown, disproven",
+    "ProverReport JSON format (format: 2) with obligations array"
+  ]
+}

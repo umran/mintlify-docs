@@ -1,0 +1,90 @@
+---
+title: "How Conseqa Verifies Your Architecture: Two-Phase Process"
+sidebarTitle: "How It Works"
+description: "Conseqa validates your model's structure, then verifies each declared requirement across five families, producing a proven, unknown, or disproven verdict."
+---
+
+Conseqa verifies your architecture model in two sequential phases. First it validates the structural coherence of your YAML declarations. If that passes, it runs the verification engine to prove — or report as unproven — each correctness requirement you have declared. The result is a set of obligation verdicts: `proven`, `unknown`, or `disproven`.
+
+## Phase 1: Validation
+
+Validation checks that your model is structurally coherent before any proof attempt. It resolves every reference, confirms that all declared IDs exist, checks that field paths resolve against their schemas, and verifies program termination and definite artifact availability.
+
+<Warning>
+Validation is fatal. If any validation error exists, verification is skipped entirely and Conseqa exits with a failure code. Fix all validation errors before expecting obligation verdicts.
+</Warning>
+
+Validation errors are printed to stderr, each with a subject ID and a message explaining the structural problem. Common causes include broken cross-references (a transaction referencing an undeclared data model), program paths that never reach a terminal (`return` or `complete`), and transaction artifacts consumed before they are established on every incoming path.
+
+## Phase 2: Verification
+
+Once a model is structurally valid, the verification engine analyzes each declared requirement and produces a verdict. Verification proceeds across five families:
+
+<CardGroup cols={2}>
+  <Card title="Serialization" icon="lock">
+    Proves that same-key invocations of an operation never overlap. Evidence comes from concurrency bounds, single-lane dispatch, or the combination of keyed topic ordering, `by_topic_key` dispatch, and `bounded(1)` lane concurrency.
+  </Card>
+  <Card title="Ordering" icon="arrow-down-1-9">
+    Proves that same-key invocations execute in their semantic precedence order. Requires both a precedence source (keyed or global topic ordering) and an execution mechanism (same-lane dispatch with `bounded(1)` concurrency) that preserves it.
+  </Card>
+  <Card title="Idempotency" icon="rotate">
+    Proves that repeated attempts at the same logical invocation produce no externally distinguishable duplicate work. Analysis follows cascades: a publication is only safe if every modeled consumer collapses duplicates; a request effect is only safe if the target operation proves its own idempotency.
+  </Card>
+  <Card title="Recoverability" icon="arrow-rotate-right">
+    Proves that an interrupted invocation can be resumed and driven to a terminal (`return` or `complete`). Analyzes whether every transaction on a path resolves on re-encounter and whether all artifacts a path consumes are available on resumption.
+  </Card>
+</CardGroup>
+
+A fifth family, **result replay**, is analyzed alongside idempotency for any requirement that declares `result: replay_consistent`. It proves that every attempt in the same idempotency class returns the same result variant and a replay-equivalent payload.
+
+## How Each Family Is Proved
+
+### Serialization
+
+Serialization — same-key invocations must not overlap — is proven from one of three structural patterns:
+
+1. **Concurrency bound:** `execution.concurrency: bounded(1)` on the operation itself caps global active invocations to one.
+2. **Single-lane dispatch:** a subscription with `dispatch.routing: single_lane` and `lane_concurrency: bounded(1)` funnels all deliveries through one non-overlapping lane.
+3. **Keyed lane isolation:** a keyed topic ordering + `by_topic_key` dispatch + `lane_concurrency: bounded(1)` ensures that same-key deliveries enter one lane and cannot overlap.
+
+Pattern 3 is the most common for event-driven operations. It provides serialization per key — different keys may still execute in parallel.
+
+### Ordering
+
+Ordering requires serialization plus a proven semantic precedence. The V1 engine recognizes one precedence source: the delivery order a keyed or global topic guarantees for same-key messages. A lane dispatches in delivery order and re-dispatches a failed delivery at the head of the lane before any later message, so `bounded(1)` concurrency prevents overtaking.
+
+A serialization mechanism alone (such as a non-FIFO lock) cannot prove ordering if it does not preserve the topic's delivery sequence.
+
+### Idempotency: Greatest-Fixpoint Analysis
+
+Idempotency analysis is the most involved of the five families. The engine evaluates every admitted program path — each path ending at `complete` or at a `return` for the triggering input — and checks three legs:
+
+- **State leg:** every transaction step must be retry-safe, either through a `deduplicated_by` keyed commit or through natural replayability derived from deterministic provenance.
+- **Effect leg:** every effect execution must be duplicate-safe. A publication is safe when the topic carries a keyed message identity for the published schema and every modeled consumer has a proven idempotency requirement. A request effect is safe when the target operation proves idempotency keyed from the targeted input. An external effect is safe when it declares `deduplicated_by` over a key that is replay-stable relative to the governing key.
+- **Control leg:** every decision on the path must replay — the branch condition must be deterministic over replay-stable roots, or the matched result must be replay-stable.
+
+Because idempotency verdicts are mutually dependent across operations (a request effect's safety depends on the target's verdict, which may in turn depend on the caller's), the engine computes all idempotency verdicts as a **greatest fixpoint**: every requirement with an admissible governing key is initially assumed proven, and requirements that fail under that assumption are dropped until nothing more fails. A cycle of requirements that each pass their local checks under the mutual assumption is marked **coinductive** in the report.
+
+### Recoverability
+
+Recoverability analysis asks whether a resumed invocation can reach a terminal for every admitted path. It checks that every transaction on a path resolves on re-encounter (by keyed commit recovery or natural replay) and that every artifact the path consumes — effect intents, transaction outputs — is available on resumption via the same two routes. Unlike idempotency, decisions are never obstacles: a retry may take any admitted path, and each path is analyzed independently.
+
+`completion: resumable` requires that resumption be *possible*. `completion: guaranteed` additionally requires a modeled retry driver — such as `delivery: at_least_once` on the triggering subscription or a `may_repeat` inbound request effect.
+
+## Verdicts Are Epistemic
+
+Every verdict is an epistemic statement about declared facts, not an observation of runtime behavior:
+
+- **`proven`** means the declared facts are sufficient to establish the property. The proof is conditional on the implementation conforming to those declarations.
+- **`unknown`** means the declared facts are insufficient to prove or disprove the property. It is not evidence of a violation.
+- **`disproven`** means a counterexample exists within the declared model.
+
+`unspecified` in any declaration means "no fact is provided." It does not mean the property is false, and it cannot contribute to any proof.
+
+## Model-Wide Notes
+
+After verification, Conseqa may raise model-wide notes that are not tied to a specific obligation. The most common: a subscription that admits `at_least_once` delivery while the operation declares no idempotency requirement keyed from that subscription. This is not an error — it may be intentional — but it is flagged because duplicate deliveries are admitted and no requirement asks the verifier to check that they are handled.
+
+<Tip>
+These notes appear alongside obligation output. In `conseqa-viz`, they appear at the top of the obligations panel when a report is loaded.
+</Tip>

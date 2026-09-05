@@ -1,0 +1,210 @@
+---
+title: "Topics, Ordering, and Message Identity in Conseqa DSL"
+sidebarTitle: "Topics & Messaging"
+description: "Topics are Conseqa's async message channels. Learn how ordering, message identity, delivery, and dispatch routing interact in verification proofs."
+---
+
+Topics are the message channels through which operations communicate asynchronously. An operation publishes to a topic through a publication effect; another operation subscribes to a topic through a subscription input. Topics carry most of the guarantees that allow the verifier to reason about ordering, idempotency, and duplicate delivery across service boundaries. What you declare on a topic is an implementation guarantee — a fact the verifier may rely on, subject to the real infrastructure conforming to it.
+
+## Topic fields
+
+```yaml
+topics:
+  topic.order_events:
+    messages:
+      - schema.OrderCreated
+      - schema.InventoryReserved
+      - schema.OrderPaid
+    ordering:
+      kind: keyed
+      mapping:
+        schema.OrderCreated: order_id
+        schema.InventoryReserved: order_id
+        schema.OrderPaid: order_id
+    message_identity:
+      kind: keyed
+      mapping:
+        schema.OrderCreated:
+          - event_id
+        schema.InventoryReserved:
+          - event_id
+        schema.OrderPaid:
+          - event_id
+```
+
+| Field | Purpose |
+|---|---|
+| `messages` | The set of schema IDs this topic may carry |
+| `ordering` | The ordering guarantee provided by the topic abstraction |
+| `message_identity` | The message-identity guarantee provided by the topic's producers |
+
+## Messages
+
+`messages` is the set of schemas the topic is allowed to carry. Membership means the topic may carry that schema — it does not assert that such a message is ever published.
+
+## Ordering
+
+Topic ordering is a **guarantee provided by the topic abstraction** about the sequence in which messages are logically observed at the subscription boundary.
+
+| Value | Meaning |
+|---|---|
+| `unspecified` | No usable ordering fact is declared |
+| `unordered` | No message-order guarantee is provided; the verifier may not rely on observed order |
+| `global` | All messages accepted by this topic participate in one logical ordered sequence |
+| `keyed` | Messages sharing the same logical key participate in one ordered sequence for that key; messages with different keys need not be ordered relative to each other |
+
+For `keyed` ordering, the `mapping` identifies which field in each carried schema holds the topic's logical key. Different schemas may map differently named fields into the same key domain.
+
+```yaml
+ordering:
+  kind: keyed
+  mapping:
+    schema.OrderCreated: order_id
+    schema.InventoryReserved: order_id
+    schema.OrderCancelled: order_id
+```
+
+<Warning>
+Topic ordering describes the order in which messages are logically observed at the subscription boundary. It does **not** imply that consumer invocations cannot overlap, that effects produced by the consumer cannot overtake one another, or that there is a meaningful business-level causal relationship between independently produced messages. To carry ordering through operation execution, dispatch routing and lane concurrency facts must also support it.
+</Warning>
+
+### Ordering is not execution serialization
+
+A keyed topic may impose a transport sequence between two concurrently produced messages for the same key. That sequence is a real transport order, but it does not prove that either message was semantically required to precede the other. The verifier distinguishes between an order that merely exists because transport serialized concurrent inputs, and a genuine upstream causal precedence the architecture is required to preserve.
+
+## Message identity
+
+`message_identity` is a **guarantee provided by the topic's producers**: it declares where the identity of one logical message lives in the payload.
+
+| Value | Meaning |
+|---|---|
+| `unspecified` | No fact relates two messages sharing field values |
+| `keyed` | For each mapped schema, the mapping gives the ordered tuple of fields holding that message's identity |
+
+For `keyed` identity, if two messages carried by the topic have equal values at the declared identity fields, they are the **same logical message** — same schema, equal payloads. This has three deliberate consequences:
+
+1. Two publications sharing an identity are attempts at publishing one logical message. The declaration says nothing about how often that message is delivered; delivery semantics govern that separately.
+2. Because equal identity implies the same schema, cross-schema identity collisions are excluded. Do not map two schemas into the same identity domain if distinct logical messages of those schemas can share an identity value.
+3. The mapping may cover a subset of the carried schemas. `keyed` ordering must route every carried message; identity is meaningful knowledge per schema and may be declared for only the schemas where you need it.
+
+```yaml
+message_identity:
+  kind: keyed
+  mapping:
+    schema.OrderCreated:
+      - event_id
+    schema.InventoryReserved:
+      - event_id
+```
+
+<Note>
+Message identity is not the ordering key. An `order_id` field correctly identifies which order's messages belong together (the ordering key domain), but it does not identify a single logical message — `OrderCreated` and `OrderPaid` for the same order share `order_id` while being different messages. Use a dedicated `event_id` field as the message identity.
+</Note>
+
+### When to declare message identity
+
+Declare message identity when you are willing for a correctness proof to rely on "same identity value implies same payload." A producer that stamps a fresh timestamp or nonce into each publication attempt does not conform to this guarantee and must not declare it.
+
+Message identity is essential for idempotency proofs involving publication effects. For the verifier to prove a publication effect safe under retries, it must establish that duplicate publications carry the same logical message (requiring keyed identity on the topic) and that every modeled consumer collapses duplicate deliveries of that message.
+
+## Subscription delivery and dispatch
+
+Subscription inputs declare how deliveries arrive and how they are routed to execution lanes. These declarations are the consumer-side counterpart to topic ordering.
+
+### Delivery semantics
+
+```yaml
+delivery: at_least_once
+```
+
+| Value | Meaning |
+|---|---|
+| `at_least_once` | A successfully published logical message may be delivered more than once; duplicate invocations are possible |
+| `at_most_once` | The same logical message is delivered no more than once; loss may still occur |
+| `unspecified` | Duplicate/loss behavior is unknown |
+
+`at_least_once` delivery means you must account for duplicate invocations. It is the driver for `completion: guaranteed` recoverability proofs: `at_least_once` delivery on the triggering subscription is one of the modeled retry drivers the verifier accepts for a guaranteed-completion proof.
+
+### Dispatch routing
+
+Dispatch routing says how deliveries are assigned to logical execution lanes.
+
+```yaml
+dispatch:
+  routing: by_topic_key
+  lane_concurrency:
+    kind: bounded
+    value: 1
+```
+
+| Routing | Meaning |
+|---|---|
+| `by_topic_key` | Deliveries sharing the topic's ordering key enter the same logical lane |
+| `single_lane` | Every delivery for this subscription enters one lane |
+| `unconstrained` | No useful affinity between related deliveries is guaranteed |
+| `unspecified` | No lane-affinity fact is available |
+
+### Lane concurrency
+
+A logical lane dispatches its deliveries in the order they entered it. A delivery leaves the lane only when its invocation has completed; a failed attempt is re-dispatched at the head of the lane before any later delivery. Lane concurrency controls whether invocations from one lane may overlap.
+
+| Value | Meaning |
+|---|---|
+| `bounded(1)` | At most one invocation from this lane is active at a time — the key serialization case |
+| `bounded(n)` | At most `n` invocations from this lane simultaneously active |
+| `unbounded` | No per-lane concurrency bound |
+| `unspecified` | No per-lane concurrency fact |
+
+### The ordering proof pattern
+
+The canonical pattern for proving same-key ordered serial execution through a subscription is a chain of three declarations, each contributing a distinct fact:
+
+```text
+keyed topic ordering
+        ↓
+  by_topic_key dispatch      (same-key deliveries enter the same lane)
+        ↓
+  lane_concurrency bounded(1) (invocations in one lane cannot overlap)
+```
+
+None of these three facts substitutes for another. A keyed topic without single-lane dispatch does not route same-key messages to a common execution context. Single-lane dispatch without bounded(1) concurrency does not prevent overlap. Bounded(1) concurrency without keyed routing does not establish which deliveries are subject to the bound.
+
+## Full topic example
+
+The following is `topic.order_events` from the flash checkout model — a keyed topic carrying six event schemas, all keyed on `order_id`, with per-schema `event_id` message identity.
+
+```yaml
+topics:
+  topic.order_events:
+    messages:
+      - schema.InventoryReserved
+      - schema.OrderCancelled
+      - schema.OrderCreated
+      - schema.OrderPaid
+      - schema.PaymentCaptured
+      - schema.PaymentFailed
+    ordering:
+      kind: keyed
+      mapping:
+        schema.InventoryReserved: order_id
+        schema.OrderCancelled: order_id
+        schema.OrderCreated: order_id
+        schema.OrderPaid: order_id
+        schema.PaymentCaptured: order_id
+        schema.PaymentFailed: order_id
+    message_identity:
+      kind: keyed
+      mapping:
+        schema.InventoryReserved:
+          - event_id
+        schema.OrderCancelled:
+          - event_id
+        schema.OrderCreated:
+          - event_id
+        schema.OrderPaid:
+          - event_id
+        schema.PaymentCaptured:
+          - event_id
+        schema.PaymentFailed:
+          - event_id
+```

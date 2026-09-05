@@ -1,0 +1,71 @@
+---
+title: "Operation View: Program Steps and Flow in conseqa-viz"
+sidebarTitle: "Operation View"
+description: "Drill into any operation to inspect its requirements, inputs, and full program control flow — transaction steps, effect executions, and proof verdicts."
+---
+
+The operation view gives you a complete picture of one operation: its declared requirements, what triggers it, and the exact control flow its program follows. Navigate to it by double-clicking any operation node in the [System View](/visualization/system-view), or directly via the URL `#/op/<id>`.
+
+## Page header
+
+The header shows the operation's name, its copyable ID, and a description (if declared). Below that, a fact strip summarizes execution context at a glance:
+
+- **Service** — the owning service
+- **Concurrency** — the declared global concurrency bound (`bounded(n)`, `unbounded`, or `unspecified`)
+- **Transaction count** — how many transactions the operation declares
+- **Step count** — the total number of steps in the program
+- **State machine links** — each state machine this operation drives, clickable to navigate to the [State Machine View](/visualization/state-machine-view)
+- **Verdict tally** — when a report is loaded, a count of proven/unknown/disproven obligations
+
+## Requirements table
+
+The requirements section lists every declared requirement in a table with one row per requirement:
+
+| Column | Contents |
+|---|---|
+| Kind | Serialization, ordering, idempotency, or recoverability |
+| Key | The declared key expression |
+| Semantics | Additional flags — `result: replay_consistent`, `completion: resumable`, `completion: guaranteed` |
+| Verdict | When a report is loaded, the obligation's status colored as proven (green), unknown (amber), or disproven (red) |
+
+Click any row to open the requirement's detail panel, which shows the obligation's summary, the assumptions the proof relied on, and the checker's evidence or obstacles.
+
+## Inputs table
+
+The inputs section lists what triggers an invocation:
+
+| Column | Contents |
+|---|---|
+| Kind | `request` or `subscription` |
+| Source | For requests: the payload schema. For subscriptions: the topic and admitted message schemas |
+| Identity / Delivery / Routing | Fact badges with tooltips explaining each declared semantic |
+
+For a subscription input, delivery semantics (`at_least_once`, `at_most_once`), dispatch routing (`by_topic_key`, `single_lane`, `unconstrained`), and lane concurrency (`bounded(n)`, `unbounded`) each appear as a badge. For a request input, the declared identity kind appears as a badge. Hover any badge to see its tooltip.
+
+## Program flow
+
+The program section renders the operation's control flow as a sequence of step cards connected by lines. Every step card carries its **location** in the format the checker uses — `1`, `2`, `3.ok.1` (one-based, arm-qualified). This location is what evidence strings in obligation reports refer to, so you can find the exact step an obstacle names.
+
+### Step card types
+
+**Transaction cards** show the transaction ID and its key facts (isolation level, idempotency kind). Clicking the card expands it in place to show the transaction's individual steps: reads, writes, inserts, deletes, locks, state-machine transitions, transaction output establishments, and effect intent establishments. Each expanded step shows its selector, field targets, and provenance derivation. A lock step shows its mode and declared lock order.
+
+**Execute-effect cards** show an effect kind badge (publication, request, or external) and the effect ID. When the step binds a result, the card also shows the binding ID and its `Result<Ok, Err>` schema pair.
+
+**Execute-intent cards** carry a dashed left stripe, indicating that the effect execution is deferred — the instance was captured inside a transaction and is now being dispatched. The card shows the intent ID and its underlying effect.
+
+**Match-result cards** show the bound result ID and render the `ok` and `err` arms side by side, each as a nested sequence of the same step card types. The arm separator makes it visually clear which steps belong to which outcome.
+
+**Branch cards** show the condition text and the `then` arm. If an `otherwise` arm exists, it appears alongside the `then` arm.
+
+**Return cards** name the request input and show the outcome variant (`ok` or `err`) and the provenance of the returned payload.
+
+**Complete cards** mark the terminal of a subscription-driven path.
+
+### Navigating from steps
+
+Clicking any entity referenced inside a step — a schema ID, an effect ID, an intent, a topic, a transaction output — opens its detail panel. Clicking a transition step inside an expanded transaction card navigates to the state machine that owns it.
+
+<Note>
+The step location notation (`3.ok.1`) is one-based and arm-qualified at every nesting level. An obstacle reported as being at `2` is the second top-level step; one at `3.ok.1` is the first step of the `ok` arm of the third top-level step.
+</Note>

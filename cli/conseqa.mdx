@@ -1,0 +1,127 @@
+---
+title: "conseqa CLI — Validate and Verify Architecture Models"
+sidebarTitle: "conseqa"
+description: "Run conseqa <MODEL.yaml> to validate your architecture model, verify its declared requirements, and print an obligation summary to stdout."
+---
+
+`conseqa` is the primary CLI tool. Give it a YAML model file and it parses the model, validates its structural coherence, runs the verification engine over every declared requirement, and prints a one-line obligation summary. Pass `--report` to write the full structured findings as JSON.
+
+```bash
+conseqa model.yaml
+conseqa model.yaml --report proof.json
+```
+
+## Arguments and Options
+
+<ParamField path="MODEL.yaml" type="string" required>
+  Path to the YAML model file. Parsed, then validated, then verified in that
+  order. Validation errors are printed and verification is skipped.
+</ParamField>
+
+<ParamField path="--report PATH" type="string">
+  Write the full obligation report as a JSON file to `PATH`. The report contains
+  every obligation with its status, assumptions, evidence, and any model-wide
+  notes. Consumable by `conseqa-viz --report` and any tooling that reads the
+  format. See [Obligations Report](/verification/obligations-report) for the schema.
+</ParamField>
+
+<ParamField path="-h, --help" type="flag">
+  Print usage information and exit.
+</ParamField>
+
+## What It Prints
+
+After a successful run, `conseqa` prints a single summary line to stdout:
+
+```
+obligations: 10 proven, 4 unknown, 0 disproven (14 total)
+```
+
+Validation errors and verification diagnostics — including notes about model-wide gaps — are printed to stderr. Each diagnostic includes a severity (`error`, `warning`, or `note`), an optional subject ID in brackets, and a message. Evidence items are indented beneath their parent diagnostic.
+
+If `--report` is given and the file is written successfully, `conseqa` prints the output path to stderr:
+
+```
+wrote proof.json
+```
+
+## Exit Codes
+
+`conseqa` exits with code `0` on a successful run (including runs that produce `unknown` obligations) and code `1` on any error — a parse failure, a validation error, or an I/O error writing the report.
+
+<Note>
+  `unknown` obligations do not cause a non-zero exit. An `unknown` verdict means
+  the verifier could not establish the property from declared facts; it is not
+  evidence of a violation and does not indicate a broken model. See
+  [Verdicts](/verification/verdicts) for the precise meaning.
+</Note>
+
+## Example Invocations
+
+<CodeGroup>
+```bash Verify a model
+conseqa flash_checkout.yaml
+```
+
+```
+obligations: 10 proven, 4 unknown, 0 disproven (14 total)
+```
+</CodeGroup>
+
+<CodeGroup>
+```bash Write a JSON report
+conseqa flash_checkout.yaml --report flash_checkout.report.json
+```
+
+```
+obligations: 10 proven, 4 unknown, 0 disproven (14 total)
+wrote flash_checkout.report.json
+```
+</CodeGroup>
+
+<CodeGroup>
+```bash A model with validation errors
+conseqa broken_model.yaml
+```
+
+```
+error [operation.reserve_inventory]: transaction tx.reserve_inventory references data model data.warehouse, which is not declared
+model is invalid; verification not attempted
+```
+</CodeGroup>
+
+<CodeGroup>
+```bash Fully proven model
+conseqa video_streaming.yaml
+```
+
+```
+obligations: 12 proven, 0 unknown, 0 disproven (12 total)
+```
+</CodeGroup>
+
+## Validation vs. Verification
+
+Validation is a prerequisite for verification. The two phases check different things:
+
+| Phase | What it checks | Fatal? |
+|---|---|---|
+| **Validation** | Structural coherence: references resolve, programs terminate, artifacts are definitely available, field paths resolve against their schemas | Yes — verification is skipped on any error |
+| **Verification** | Correctness properties: serialization, ordering, idempotency, recoverability, result replay | No — unproven obligations are reported as `unknown`, not errors |
+
+A model can be structurally valid and still have `unknown` obligations. That is the normal working state for a model under development.
+
+## Passing Reports to conseqa-viz
+
+Once you have a report, pass it to `conseqa-viz` to see the obligation findings overlaid on an interactive architecture visualization:
+
+```bash
+conseqa flash_checkout.yaml --report flash_checkout.report.json
+conseqa-viz flash_checkout.yaml --report flash_checkout.report.json
+```
+
+Or run both steps at once with `conseqa-viz --verify`:
+
+```bash
+conseqa-viz flash_checkout.yaml --verify --out flash_checkout.html
+```

@@ -1,0 +1,153 @@
+---
+title: "Install Conseqa: Build from Source and Verify Setup"
+sidebarTitle: "Installation"
+description: "Build both Conseqa binaries from source using Cargo, add them to your PATH, and verify the installation with the built-in help output."
+---
+
+Conseqa is distributed as source code and built with Cargo, the standard Rust build tool. You do not need Node.js or any other runtime to run the binaries — the `conseqa-viz` front end is a pre-built React bundle embedded directly in the binary at compile time.
+
+## Prerequisites
+
+You need a **stable Rust toolchain** with Cargo. The recommended way to install one is via [rustup](https://rustup.rs/):
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Verify your installation:
+
+```bash
+rustc --version
+cargo --version
+```
+
+Any recent stable release works. Conseqa's `Cargo.toml` specifies `edition = "2024"`, so use Rust 1.85 or later.
+
+## Build from source
+
+Clone the repository and run a release build:
+
+```bash
+git clone https://github.com/umran/conseqa
+cd conseqa
+cargo build --release
+```
+
+Cargo resolves and compiles all dependencies automatically. The build produces two binaries under `target/release/`:
+
+| Binary | Purpose |
+|---|---|
+| `target/release/conseqa` | Validates and verifies a YAML model; prints an obligation summary; optionally writes a JSON report. |
+| `target/release/conseqa-viz` | Generates a self-contained interactive HTML visualization of a model, optionally overlaying the obligation report. |
+
+## Add to PATH
+
+To invoke either tool from any directory without a full path, add the release directory to your `PATH`. Add this line to your shell profile (`.bashrc`, `.zshrc`, or equivalent):
+
+```bash
+export PATH="/path/to/conseqa/target/release:$PATH"
+```
+
+Reload your shell or run `source ~/.zshrc` (adjust for your shell), then confirm the tools are available:
+
+```bash
+which conseqa
+which conseqa-viz
+```
+
+## Verify the installation
+
+Run each tool with `--help` to confirm it is reachable and working:
+
+```bash
+conseqa --help
+```
+
+```text
+conseqa — validate and verify an Conseqa model
+
+USAGE:
+    conseqa <MODEL.yaml> [OPTIONS]
+
+OPTIONS:
+    --report <PATH>    Write the obligation report (JSON), consumable
+                       by conseqa-viz --report.
+    -h, --help         Show this help.
+```
+
+```bash
+conseqa-viz --help
+```
+
+```text
+conseqa-viz — interactive visualization for Conseqa models
+
+USAGE:
+    conseqa-viz <MODEL.yaml> [OPTIONS]
+
+OPTIONS:
+    --out <PATH>       Output path. Defaults to <MODEL>.html, or stdout
+                       for --example-report.
+    --report <PATH>    Prover report (JSON) to overlay on the model.
+    --verify           Run the model checker and overlay its obligation
+                       report, instead of reading one from --report.
+    --json             Instead of rendering HTML, emit the page data
+                       (title, model, graph, report) as JSON, for the
+                       front end's development server.
+    --title <TITLE>    Page title. Defaults to the model file name.
+    --example-report   Instead of rendering, emit a scaffold prover
+                       report enumerating every obligation implied by
+                       the model's declared requirements, with every
+                       status 'unknown'. Documents the report format
+                       the visualization consumes.
+    --no-validate      Skip analyzer validation warnings.
+    -h, --help         Show this help.
+```
+
+Run the included fixture to confirm end-to-end verification works:
+
+```bash
+conseqa tests/fixtures/minimal.yaml
+```
+
+```text
+obligations: 0 proven, 0 unknown, 0 disproven (0 total)
+```
+
+## A note on the visualization front end
+
+`conseqa-viz` embeds a pre-built React + TypeScript bundle at compile time using Rust's `include_str!` macro. The compiled binary is fully self-contained: it requires no Node.js, no npm, and no network access at runtime.
+
+<Note>
+  If you modify the front end source in `viz/`, you must rebuild the bundle and commit the result before the changes take effect in `conseqa-viz`. See the `viz/` directory for build instructions (`npm run build` produces `viz/dist/index.html`, which the Rust build then embeds).
+</Note>
+
+The production bundle is a single HTML file with every script and stylesheet inlined via `vite-plugin-singlefile`. When `conseqa-viz` generates output, it injects the page data — title, model, derived graph, and report — as `window.CONSEQA` into that bundle.
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Build fails with 'edition 2024 is not supported'">
+    Upgrade your Rust toolchain. Conseqa requires Rust 1.85 or later, which introduced the 2024 edition.
+
+    ```bash
+    rustup update stable
+    ```
+  </Accordion>
+  <Accordion title="'conseqa: command not found' after adding to PATH">
+    Make sure you sourced your shell profile after editing it, and that the path you added points to the `target/release` directory inside the cloned repository — not to the repository root.
+
+    ```bash
+    ls /path/to/conseqa/target/release/conseqa
+    ```
+
+    If the file is not there, the build may not have completed successfully. Re-run `cargo build --release` and check for errors.
+  </Accordion>
+  <Accordion title="'cannot read model.yaml: No such file or directory'">
+    `conseqa` and `conseqa-viz` resolve the model path relative to the working directory. Make sure you are in the right directory or provide an absolute path:
+
+    ```bash
+    conseqa /absolute/path/to/model.yaml
+    ```
+  </Accordion>
+</AccordionGroup>

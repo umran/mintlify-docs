@@ -1,0 +1,152 @@
+---
+title: "Services, Schemas, and Data Models in Conseqa Models"
+sidebarTitle: "Services & Schemas"
+description: "Learn how Conseqa models ownership boundaries, value shapes, and persistent object identities using services, schemas, and data models."
+---
+
+Services, schemas, and data models are the structural foundation of a Conseqa model. Services group operations by ownership, schemas describe value shapes, and data models define the transactional state boundaries that operations read and write. None of these sections contain executable logic — they are declarations the verification engine reasons from.
+
+## Services
+
+A service is a logical ownership boundary. Every operation declares exactly one service as its owner. Services have no runtime semantics of their own: they imply no process boundary, no network hop, no trust domain, no replica count, and no availability guarantee. Those facts must come from other declarations if they matter to a proof.
+
+### Service kinds
+
+Assign one of four kinds to every service:
+
+| Kind | Typical use |
+|---|---|
+| `backend` | A synchronously invoked service, such as an API server |
+| `frontend` | A client-facing layer |
+| `worker` | A background processor that consumes messages from topics |
+| `job` | A scheduled or one-shot batch processor |
+
+Kind is descriptive only. The verifier does not infer any behavioral guarantee from the kind alone.
+
+```yaml
+services:
+  service.checkout:
+    kind: backend
+  service.inventory:
+    kind: backend
+  service.payments:
+    kind: worker
+```
+
+## Schemas
+
+A schema describes the logical shape of a value. Schemas appear as request payloads, event message types, data object state types, response types, and anywhere else a structured value must be named and typed.
+
+There are two schema kinds: `canonical` and `fragment`.
+
+### Canonical schemas
+
+A canonical schema defines a shape directly with a map of named fields. It also declares `completeness`, which controls what the verifier may infer about undeclared fields.
+
+```yaml
+schemas:
+  schema.OrderRecord:
+    kind: canonical
+    completeness: complete
+    fields:
+      order_id: uuid
+      status: string
+      amount: decimal
+```
+
+**`completeness: complete`** claims that the declaration describes the entire logical schema. The verifier may treat any field absent from a `complete` schema as nonexistent — useful when you need exhaustive field knowledge to complete a proof.
+
+**`completeness: partial`** explicitly permits the real schema to contain undeclared fields. The verifier may reason about the fields you declared, but it must not infer that undeclared fields do not exist. Use `partial` when your model describes only the fields that matter for the properties under verification.
+
+### Fragment schemas
+
+A fragment schema is a projection or aliasing view over a canonical schema. You declare the `source` canonical schema and a `mapping` from each fragment field name to a field path in the source.
+
+```yaml
+schemas:
+  schema.OrderSummary:
+    kind: fragment
+    source: schema.OrderRecord
+    mapping:
+      id: order_id
+      state: status
+```
+
+A fragment mapping asserts semantic identity: the fragment field and the source field hold the same logical value. This lets the verifier preserve value lineage across schema boundaries even when fields are renamed. A fragment does not create new independent storage, and it does not imply that unmapped source fields are absent. Fragment chains must be acyclic.
+
+### Field type syntax
+
+Declare field types using a concise shorthand. The grammar is `type := scalar | schema-id | "[" type "]"` with an optional `?` suffix for optional fields.
+
+**Scalar types:** `string`, `bool`, `int`, `float`, `decimal`, `uuid`, `timestamp`
+
+**Schema references:** prefix with `schema.` to reference another declared schema
+
+**Lists:** wrap in `[` `]` to declare a list of the inner type
+
+**Optional fields:** append `?` to the field type
+
+```yaml
+fields:
+  order_id: uuid               # required scalar
+  note: string?                # optional scalar
+  customer: schema.Customer    # required schema reference
+  items: [schema.LineItem]     # required list of schema references
+  tags: "[string]?"            # optional list of strings
+```
+
+<Note>
+The `?` suffix marks the field as optional, not the type. `[string?]` is an error; write `"[string]?"` for an optional list.
+</Note>
+
+A schema name that collides with a scalar name (`string`, `bool`, etc.) or ends with `?` must be declared using the canonical map form rather than the shorthand. The verifier always serializes in canonical form; the shorthand is an authoring convenience.
+
+## Data models
+
+A data model is a **logical transactional state boundary**. It is not necessarily one database server, one vendor product, or one schema namespace — what matters is that a transaction declaring this data model is modeled as operating against this shared transactional boundary.
+
+```yaml
+data_models:
+  data.checkout:
+    objects:
+      object.order:
+        schema: schema.OrderRecord
+        identity:
+          - order_id
+  data.inventory:
+    objects:
+      object.stock:
+        schema: schema.StockRecord
+        identity:
+          - warehouse_id
+          - sku
+```
+
+### Data objects
+
+Each `DataObject` inside a data model declares:
+
+- **`schema`**: the canonical schema that describes the state of one instance. The schema must be canonical (not a fragment).
+- **`identity`**: the complete, non-empty composite key that uniquely identifies one instance.
+
+### Object identity
+
+The `identity` list is a single composite key — not a set of independent alternative keys. Every component listed is required to identify one instance.
+
+```yaml
+identity:
+  - warehouse_id
+  - sku
+```
+
+This means an instance is identified by the tuple `(warehouse_id, sku)`. Two instances cannot share the same complete identity value; the verifier uses this constraint for insert-uniqueness and selector-overlap analysis.
+
+Object identity is the anchor for state machine transitions, transaction selectors, and lock analysis. Declare it carefully — it is intrinsic to the logical object model.
+
+<Tip>
+Use a dedicated identity field like `uuid` rather than a compound natural key when your domain may need to decouple the logical identity from mutable attributes. The identity declaration drives how the verifier distinguishes object instances.
+</Tip>
+
+## What data models do not declare
+
+A `DataObject` declaration carries no object-history requirements such as linearizability. Conseqa models transaction and operation correctness; end-to-end object-history consistency requirements (which would require modeling replica topology, read routing, quorum, and partition assumptions) are outside the current scope. The serialization, isolation, lock, and state-transition declarations inside transactions cover the correctness facts Conseqa currently reasons about.

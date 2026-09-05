@@ -1,0 +1,148 @@
+---
+title: "Integrating Conseqa Verification into Your CI Pipeline"
+sidebarTitle: "CI Integration"
+description: "Run Conseqa in CI to catch regressions, detect disproven obligations, and archive proof reports and HTML visualizations as pipeline artifacts."
+---
+
+Running Conseqa in CI gives your team a formal check on every change that touches the architecture model. A regression that would introduce a disproven obligation or break a previously proven one is caught before it merges, and the obligation report and visualization HTML become searchable artifacts attached to every build.
+
+## Build step
+
+Conseqa ships as a Rust crate. Build the release binaries once per pipeline environment or Docker layer:
+
+```bash
+cargo build --release
+# binaries at target/release/conseqa and target/release/conseqa-viz
+```
+
+If you maintain pre-built binaries or a container image, place them on `PATH` and use `conseqa` and `conseqa-viz` directly in subsequent steps.
+
+## Run the verifier
+
+Verify your model and write the obligation report to a file:
+
+```bash
+conseqa model.yaml --report report.json
+```
+
+The tool prints an obligation summary to stdout and exits with a non-zero code only when the model fails to parse or fails validation (malformed YAML, invalid references). A model that validates and verifies — regardless of how many obligations are `proven`, `unknown`, or `disproven` — exits zero. Use the report JSON to inspect verdicts and enforce your own pass/fail policy.
+
+<Note>
+`unknown` obligations are epistemic: the checker could not establish the property from the declared facts. They are never evidence of a violation. `disproven` obligations mean the checker found a counterexample — inspect these with `conseqa-viz --report report.json` to understand the evidence.
+</Note>
+
+## Generate the visualization artifact
+
+After the report is written, generate the HTML visualization:
+
+```bash
+conseqa-viz model.yaml --report report.json --out architecture.html
+```
+
+This step uses the already-computed report rather than re-running verification, so it adds minimal time to the pipeline. The output is a single self-contained HTML file with the full interactive proof overlay.
+
+## GitHub Actions example
+
+Add a job to your workflow that runs on any push touching the model file:
+
+```yaml
+name: Architecture verification
+
+on:
+  push:
+    paths:
+      - "model.yaml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    paths:
+      - "model.yaml"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build Conseqa
+        run: cargo build --release
+
+      - name: Verify architecture model
+        run: ./target/release/conseqa model.yaml --report report.json
+
+      - name: Generate visualization
+        if: always()
+        run: >
+          ./target/release/conseqa-viz model.yaml
+          --report report.json
+          --out architecture.html
+          --title "${{ github.repository }} architecture"
+
+      - name: Upload proof report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proof-report
+          path: report.json
+
+      - name: Upload visualization
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: architecture-visualization
+          path: architecture.html
+```
+
+The `if: always()` guards on the visualization and upload steps ensure that artifacts are produced even when the verify step fails, so you can inspect the proof state on a failing build.
+
+## Keeping the model with your service code
+
+Store `model.yaml` in the same repository as your service code, not in a separate architecture repository. This keeps the model in sync with the implementation it describes and makes diff review natural:
+
+```
+my-service/
+  src/
+  model.yaml        ← lives here
+  report.json       ← committed baseline (see tip below)
+  Cargo.toml
+```
+
+When a code change requires a model update, the model diff and the implementation diff land in the same pull request. Reviewers can see both together, and CI verifies the updated model against the updated code in the same build.
+
+## Failing on disproven obligations
+
+`conseqa` exits zero after verification regardless of verdict counts — the exit code only signals whether the model is structurally valid. To fail the build on unwanted obligation statuses, add an explicit check using the report JSON:
+
+```bash
+# Fail if any obligation is disproven
+jq -e '[.obligations[] | select(.status == "disproven")] | length == 0' report.json
+```
+
+To require that every obligation is `proven` — rejecting both `unknown` and `disproven`:
+
+```bash
+# Fail if any obligation is not 'proven'
+jq -e '[.obligations[] | select(.status != "proven")] | length == 0' report.json
+```
+
+Adjust the filter to match your team's policy. A newly added requirement starts as `unknown`; you can choose to treat that as a warning or a hard block depending on your workflow.
+
+## Tracking obligation status over time
+
+<Tip>
+Commit `report.json` to your repository as a baseline. When the verifier's output changes — a previously `unknown` obligation becomes `proven`, or a new requirement is added — the diff in `report.json` makes the change visible in code review. Reviewers can confirm that new obligations are intentional and that any regression from `proven` to `unknown` is understood.
+</Tip>
+
+A committed report also means the visualization step in CI never needs to re-run verification: it loads the committed report directly, which keeps the viz step fast regardless of model complexity.

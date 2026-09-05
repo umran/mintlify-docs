@@ -1,0 +1,65 @@
+---
+title: "System View: Services, Topics, and Routes in conseqa-viz"
+sidebarTitle: "System View"
+description: "Explore your full microservice architecture as an interactive SVG graph — services, topics, external systems, and every information route between them."
+---
+
+The system view is the entry point for `conseqa-viz`. It renders your entire architecture as a directed SVG graph, giving you an at-a-glance picture of what services exist, how operations communicate, and where the model's proof obligations land.
+
+## Layout and nodes
+
+The graph places services as boundary boxes with their operations inside. Topics, external systems, and a synthetic **Client** node sit around them:
+
+- **Service boxes** — each service is drawn as a named boundary box containing its operations as labeled nodes inside it.
+- **Topic nodes** (pill-shaped) — one node per declared topic.
+- **External system nodes** — one node per external effect target.
+- A synthetic **Client** node — represents callers that invoke request inputs no modeled operation invokes.
+
+## Edge types
+
+Every edge in the graph corresponds to a declared information route. The style tells you what kind of route it is:
+
+| Kind | Direction | Meaning |
+|---|---|---|
+| Publish | Operation → Topic | An operation publishes a message to a topic |
+| Subscribe | Topic → Operation | An operation receives messages from a topic |
+| Request | Operation → Operation | An operation invokes another operation's request input |
+| External | Operation → External | An operation calls an external system |
+| Client | Client → Operation | An external caller invokes a request input |
+
+**Dashed edges** indicate a *declared but unexecuted* capability: the effect exists on the operation but no step in its program ever executes it. A solid edge names the program step locations (for example, `2` or `3.ok.1`) that execute it in its detail panel. Effects owned by state-machine transitions are attributed to the operations that execute them through intents and marked "via transition."
+
+## Requirement badges
+
+Each operation node carries badges for the requirement kinds declared on it:
+
+- **S** — Serialization
+- **O** — Ordering
+- **I** — Idempotency
+- **R** — Recoverability
+
+These badges are always visible regardless of whether a proof report is loaded.
+
+## Proof overlays
+
+When you load a report (via `--verify` or `--report`), the graph gains status indicators:
+
+- **Status rings** appear around operation and topic nodes, colored by the worst obligation status across that node's requirements: green for proven, amber for unknown, red for disproven.
+- **Rollup chips** display a count of obligations at each status level.
+- Requirement badges on operation nodes are colored individually to reflect their obligation's verdict.
+
+The rule for rollup is: disproven overrides unknown, which overrides proven. A single disproven obligation turns the whole node's ring red.
+
+## Interacting with the graph
+
+**Click** any node, edge, topic, or external system node to open the **detail panel** on the right. The panel shows the entity's declared facts organized into collapsible sections with key/value grids and clickable IDs that open related entities in place.
+
+**Double-click** an operation node to navigate directly to its [Operation View](/visualization/operation-view).
+
+**Filter** nodes by name using the search box in the top bar. Non-matching nodes are dimmed. Clear the filter to restore the full graph.
+
+**Re-center** the graph using the fit control in the canvas corner. The graph supports pan and zoom with standard mouse or trackpad gestures.
+
+## Top bar
+
+When a report is loaded, the top bar gains an **Obligations** button carrying the total tally. Clicking it opens the obligations panel, which lets you browse all obligations grouped by subject, filter by status (all / unknown / proven / disproven), and expand individual cards to see the declared assumptions, checker evidence, or a counterexample trace.

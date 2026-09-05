@@ -1,0 +1,91 @@
+---
+title: "Generate Interactive HTML Visualizations with conseqa-viz"
+sidebarTitle: "Overview"
+description: "Generate a self-contained, interactive HTML visualization of your Conseqa model — with or without proof results — using the conseqa-viz tool."
+---
+
+`conseqa-viz` turns any Conseqa model into a single interactive HTML file you can open directly from disk, attach to a pull request, or share as a design artifact. The output makes no network requests, has no external dependencies, and works fully offline.
+
+## Generating a visualization
+
+Pass your model file as the only required argument. By default the tool writes an HTML file alongside the model:
+
+```bash
+conseqa-viz model.yaml
+# wrote model.html
+```
+
+To choose the output path or add a page title, use `--out` and `--title`:
+
+```bash
+conseqa-viz model.yaml --out docs/architecture.html --title "checkout architecture"
+```
+
+## Overlaying proof results
+
+The HTML viewer becomes most useful when it shows the checker's verdicts alongside your architecture. You have two options:
+
+<CodeGroup>
+```bash Run and overlay in one step
+conseqa-viz model.yaml --verify
+```
+
+```bash Overlay a previously saved report
+conseqa-viz model.yaml --report proof.json
+```
+</CodeGroup>
+
+`--verify` runs the full model checker in-process before rendering. `--report` loads a JSON report you produced earlier with `conseqa model.yaml --report proof.json`. The two flags are mutually exclusive.
+
+<Tip>
+Use `--report` in CI so the visualization step never needs to re-run verification. Produce the report once with `conseqa`, archive it as an artifact, then render the HTML separately with `conseqa-viz --report`.
+</Tip>
+
+## Validation during rendering
+
+`conseqa-viz` runs analyzer validation before rendering and prints any diagnostics to stderr. Rendering proceeds even on a model with validation warnings — imperfect models can still be inspected. To suppress the validation pass entirely, pass `--no-validate`.
+
+## Scaffolding a report
+
+If you want to understand the report format or fill in verdicts manually, generate a scaffold with every obligation set to `unknown`:
+
+```bash
+conseqa-viz model.yaml --example-report
+```
+
+The output goes to stdout unless you supply `--out`.
+
+## The three views
+
+The HTML contains three interconnected views. Navigate between them using the breadcrumbs in the top bar or by clicking entities in the current view.
+
+<CardGroup cols={2}>
+  <Card
+    title="System View"
+    icon="diagram-project"
+    href="/visualization/system-view"
+  >
+    The full architecture as an SVG graph — services, topics, external systems, and the edges that connect them.
+  </Card>
+  <Card
+    title="Operation View"
+    icon="code-branch"
+    href="/visualization/operation-view"
+  >
+    Program flow, requirements, and inputs for any individual operation. Double-click an operation node to drill in.
+  </Card>
+  <Card
+    title="State Machine View"
+    icon="circle-nodes"
+    href="/visualization/state-machine-view"
+  >
+    Lifecycle diagrams for every declared state machine, with transitions, side effects, and proof overlays.
+  </Card>
+  <Card
+    title="Modeling a Checkout Flow"
+    icon="cart-shopping"
+    href="/guides/modeling-a-checkout-flow"
+  >
+    A step-by-step walkthrough of the flash-sale checkout example, from YAML to visualization.
+  </Card>
+</CardGroup>

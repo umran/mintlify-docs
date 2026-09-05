@@ -1,0 +1,196 @@
+---
+title: "Proving Idempotency Requirements in Conseqa Models"
+sidebarTitle: "Proving Idempotency"
+description: "Learn how to declare and prove idempotency requirements in Conseqa, using the fully-proven video streaming pipeline as a working example."
+---
+
+Idempotency in Conseqa means that repeated attempts representing the same logical invocation produce the effects of exactly one invocation. The verifier does not settle for declaring a field named `idempotency_key` or checking that a table has a unique index — it traces every effect the operation causes, including cascades into downstream operations and consumers, and establishes that none of them perform distinguishable duplicate work.
+
+This guide walks through the `video_streaming.yaml` fixture, where every obligation proves. It shows each ingredient that enables a proof and explains what happens when one is missing.
+
+## What the verifier checks
+
+For each declared idempotency requirement, the verifier analyzes every admitted path through the program and applies three checks:
+
+**State leg.** Every transaction on the path must be retry-safe. A transaction is retry-safe in one of two ways:
+
+1. **Natural replayability** — the verifier can establish from the transaction's declared isolation, mutation semantics, and provenance that a second execution produces the same logical outcome.
+2. **Keyed commit deduplication** — the transaction declares `deduplicated_by` with a stable key. On re-encounter, the prior commit resolves and its artifacts are restored without re-executing the body.
+
+**Effect leg.** Every effect-executing step must be duplicate-safe. Publications, requests, and external effects each have their own discharge conditions. Critically, the check is transitive: a publication is only safe if every modeled consumer collapses duplicate deliveries, which means that consumer's idempotency must also be proven.
+
+**Control leg.** Every decision on the path must replay. A `match_result` replays if the matched result is stable across attempts. A `branch` replays if its condition is deterministic over stable roots. An unstable decision means a retry may take a different arm and do different work.
+
+## Declaring an idempotency requirement
+
+Add `idempotency` to the operation's `requirements` block:
+
+```yaml
+requirements:
+  idempotency:
+    - key:
+        components:
+          - source: input:input.complete_upload.request
+            path: upload_id
+      result: replay_consistent
+```
+
+The `key` identifies the logical invocation class. All key components must come from a single input of the operation — the triggering input. The verifier uses this key to determine which two attempts it is reasoning about as "the same logical invocation."
+
+`result: replay_consistent` adds a further obligation: not only must repeated attempts avoid duplicate work, they must return the same result variant and a replay-equivalent payload. Omit it if you only care about effect safety and not result stability.
+
+## The video streaming example
+
+The `video_streaming.yaml` fixture models a pipeline where clients upload videos, a transcoder renders them, a catalog publishes them, and a notifier informs the owner. Every obligation proves. Here is what makes each operation's idempotency provable.
+
+### `complete_upload` — keyed commit plus intent recovery
+
+```yaml
+transactions:
+  tx.complete_upload.register:
+    data_model: data.videos
+    isolation: read_committed
+    idempotency:
+      kind: deduplicated_by
+      key:
+        components:
+          - source: input:input.complete_upload.request
+            path: upload_id
+    steps:
+      - kind: insert
+        object: object.video
+        values:
+          kind: deterministic
+          from:
+            - source: input:input.complete_upload.request
+              path: video_id
+            - source: input:input.complete_upload.request
+              path: owner_id
+            - source: input:input.complete_upload.request
+              path: source_uri
+      - kind: establish_effect_intent
+        intent: intent.complete_upload.publish_uploaded
+        values:
+          kind: deterministic
+          from:
+            - source: input:input.complete_upload.request
+              path: upload_id
+            - source: input:input.complete_upload.request
+              path: video_id
+```
+
+The transaction is `deduplicated_by` the request's `upload_id`, which is also the idempotency key. This means:
+
+- A second attempt under the same `upload_id` resolves the prior commit and restores `intent.complete_upload.publish_uploaded` without re-inserting the video record.
+- The intent instance is recovered from the keyed commit, so even if the process crashes between the commit and the `execute_effect_intent` step, a retry delivers the same logical `VideoUploaded` message.
+
+The request also declares a keyed identity on `upload_id`:
+
+```yaml
+input.complete_upload.request:
+  kind: request
+  schema: schema.UploadCompleteRequest
+  identity:
+    kind: keyed
+    fields:
+      - upload_id
+```
+
+This declares that any two requests with the same `upload_id` present equal payloads — which makes every field of the request payload replay-stable under the governing key. The verifier relies on this when reasoning about the transaction output and return value.
+
+### `transcode_video` — external deduplication fixes the control decision
+
+`transcode_video` is the most interesting case. It calls an external transcoding engine and branches on the result:
+
+```yaml
+effects:
+  effect.transcode_video.engine:
+    kind: external
+    name: transcoding-engine.render
+    idempotency:
+      kind: deduplicated_by
+      key:
+        components:
+          - source: input:input.transcode_video.uploaded
+            path: video_id
+    result:
+      ok: schema.RenderCompleted
+      err:
+        schema: schema.RenderFailed
+        disposition: terminal
+```
+
+Two declarations work together here:
+
+**`deduplicated_by` with a stable key.** The key is `video_id` from the subscription input, which is replay-stable because the topic declares a keyed message identity on `event_id` and the governing key is `event_id`. Stable key components are not the full picture — the identity pinning rules in the semantics make the full input payload stable, from which `video_id` is deterministically available.
+
+**`disposition: terminal` on the `err` variant.** The `match_result` on the render result at step 3 branches on a bound external result. For this decision to replay — for every attempt to take the same arm — the result must be replay-stable. A `deduplicated_by` external effect fixes the terminal result once it is reached: after the first terminal `Ok` or terminal `Err`, every same-key execution observes the same variant and a replay-equivalent payload. But a retryable `Err` is not a terminal result — it is a per-attempt outcome that says another try is admitted — and an `Err` with unspecified disposition provides no terminality fact.
+
+By declaring `disposition: terminal`, the model states that an `Err` from the transcoding engine conclusively resolves that video's render. The verifier can then establish that the `match_result` on the result replays: a retry observes the same terminal variant, takes the same arm, and does the same subsequent work.
+
+<Warning>
+If you change `disposition: terminal` to `disposition: retryable` or `disposition: unspecified`, the `match_result` at step 3 is no longer established to replay, and `transcode_video`'s idempotency becomes `unknown`. The cascade then propagates to `complete_upload` through the `VideoUploaded` → `transcode_video` subscription.
+</Warning>
+
+### `publish_video` and `notify_published` — keyed commits throughout
+
+Both downstream operations follow the same pattern as `complete_upload`: their transactions declare `deduplicated_by` a stable `event_id` key from the subscription input, and their effects are either publications with message identity (safe via the topic's dedup guarantee on the consumer side) or external effects with `deduplicated_by`:
+
+```yaml
+# notify_published — external push gateway deduplicates by event_id
+effects:
+  effect.notify_published.push:
+    kind: external
+    name: push-gateway.notify
+    idempotency:
+      kind: deduplicated_by
+      key:
+        components:
+          - source: input:input.notify_published.published
+            path: event_id
+    result: null
+```
+
+The push gateway declares `deduplicated_by` the subscription's `event_id`. Because `event_id` is the message identity field on `topic.video_events`, and the governing key is the subscription's `event_id`, the key component is replay-stable. The external boundary collapses duplicate executions under the same key.
+
+## Idempotency key components must be replay-stable
+
+The verifier refuses to treat any component of an idempotency key as stable unless it can be derived from the rules. The key components must come from the triggering input, and the triggering input's fields are only stable if the input declares a keyed identity that pins them, or the topic declares a keyed message identity covering all admitted schemas.
+
+A common failure mode is using a `transaction_read` result as a key component:
+
+```yaml
+# This will not prove — transaction_read results are never replay-stable
+key:
+  components:
+    - source: transaction_read:read.some_tx.row
+      path: some_id
+```
+
+Transaction-read results are local to the transaction execution that produced them and are always treated as unknown for replay purposes.
+
+## Going from `unknown` to `proven`
+
+When an obligation is `unknown`, the checker's evidence tells you exactly what is missing. Common patterns and their fixes:
+
+<AccordionGroup>
+  <Accordion title="Transaction not retry-safe">
+    The transaction is not `deduplicated_by` a stable key and cannot be proven naturally replayable. Add `deduplicated_by` with a key whose components all derive from the triggering input, using only key components or identity-pinned fields as roots.
+  </Accordion>
+
+  <Accordion title="External effect not deduplicated">
+    The external effect is `not_deduplicated` or has `unspecified` idempotency. If the external boundary supports deduplication, declare `deduplicated_by` with a stable key. If it genuinely does not, the obligation cannot be proven without redesigning the integration.
+  </Accordion>
+
+  <Accordion title="Control decision not established to replay">
+    A `match_result` branches on an unstable result. For an external effect, ensure the boundary declares `deduplicated_by` and the error disposition is `terminal`. For a request effect, ensure the target operation proves `result: replay_consistent` for the targeted input.
+  </Accordion>
+
+  <Accordion title="Downstream consumer idempotency unproven">
+    A publication effect's safety is conditional on every modeled consumer collapsing duplicates. If a consumer's idempotency is `unknown`, the upstream obligation inherits the gap. Fix the consumer's obstacles first; the upstream proof follows automatically through the verifier's greatest-fixpoint computation.
+  </Accordion>
+
+  <Accordion title="Message identity not declared on topic">
+    Without a keyed `message_identity` on the topic, two messages with equal `event_id` are not declared to be the same logical message. Declare `message_identity` on the topic with a mapping for each admitted schema. Without it, duplicate deliveries may have different payloads from the verifier's perspective and cannot be proven safe.
+  </Accordion>
+</AccordionGroup>

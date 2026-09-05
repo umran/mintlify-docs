@@ -1,0 +1,80 @@
+---
+title: "A Formal Model Checker for Microservices Architectures"
+sidebarTitle: "Home"
+description: "Model your microservice architecture in YAML and let Conseqa formally verify correctness properties like ordering, idempotency, and serialization."
+---
+
+Conseqa is a formal model checker for distributed microservices architectures. You describe your microservice architecture in a YAML-based DSL — services, schemas, data models, topics, state machines, and operations — and Conseqa's verification engine statically proves whether your declared correctness requirements hold, reporting each obligation as `proven`, `unknown`, or `disproven`. When you need to share or review a model, `conseqa-viz` renders it as a single self-contained HTML file with an interactive system graph, per-operation program drill-down, and obligation overlays.
+
+<CardGroup cols={2}>
+  <Card title="Introduction" icon="book-open" href="/introduction">
+    Understand what Conseqa does, why it matters, and how its epistemic proof model works.
+  </Card>
+
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Write a YAML model, run the verifier, and view your first obligation report in under five minutes.
+  </Card>
+
+  <Card title="Core Concepts" icon="shapes" href="/concepts/model-overview">
+    Learn about services, schemas, topics, state machines, operations, and requirements.
+  </Card>
+
+  <Card title="CLI Reference" icon="terminal" href="/cli/conseqa">
+    Full reference for the `conseqa` and `conseqa-viz` command-line tools.
+  </Card>
+</CardGroup>
+
+## How it works
+
+<Steps>
+  <Step title="Write a YAML model">
+    Describe your architecture using Conseqa's DSL. Declare services, data models, message topics, and the operations that tie them together — each with explicit requirements for correctness properties you need to hold.
+
+    ```yaml
+    revision: 1
+    
+    services:
+      service.ingest:
+        kind: backend
+      service.transcoder:
+        kind: worker
+    
+    topics:
+      topic.video_events:
+        messages:
+          - schema.VideoUploaded
+        ordering:
+          kind: keyed
+          mapping:
+            schema.VideoUploaded: video_id
+        message_identity:
+          kind: keyed
+          mapping:
+            schema.VideoUploaded:
+              - event_id
+    ```
+  </Step>
+  <Step title="Run the verifier">
+    Pass your model to `conseqa`. Validation checks structural coherence; verification discharges each declared requirement and prints an obligation summary.
+
+    ```bash
+    conseqa model.yaml
+    ```
+
+    ```text
+    obligations: 8 proven, 0 unknown, 0 disproven (8 total)
+    ```
+  </Step>
+  <Step title="View the results">
+    Generate an interactive HTML visualization — with obligation status overlaid — and open it in any browser. No server required.
+
+    ```bash
+    conseqa-viz model.yaml --verify --out model.html
+    open model.html
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  Every verdict is epistemic. `unknown` means the verifier could not establish the property from the declared facts — it is not evidence of a violation. See [Introduction](/introduction) for the full proof model.
+</Note>

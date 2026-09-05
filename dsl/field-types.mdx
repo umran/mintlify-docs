@@ -1,0 +1,316 @@
+---
+title: "Conseqa DSL Field Types, Scalars, and Schema Forms"
+sidebarTitle: "Field Types"
+description: "Complete reference for Conseqa's type system: scalar types, optional and list fields, schema references, canonical and fragment schemas, and completeness."
+---
+
+Schemas in Conseqa describe the logical shape of every value the model reasons about — request payloads, event messages, persistent object state, and the data exported by transactions. Every field has a type and an optionality flag. The type system is deliberately logical: no storage width, wire encoding, timezone, or precision is implied beyond what the type name itself requires.
+
+## Scalar types
+
+Seven primitive logical types are available. Use them by name wherever a type is expected.
+
+| Type | Meaning |
+|---|---|
+| `string` | A sequence of characters. No length bound or encoding is implied. |
+| `bool` | A Boolean value: true or false. |
+| `int` | An integer value. No width or signedness is implied. |
+| `float` | A floating-point value. No precision or IEEE variant is implied. |
+| `decimal` | An exact decimal value. Use for monetary amounts where binary float rounding is not acceptable. |
+| `uuid` | A universally unique identifier. |
+| `timestamp` | A point in time. No timezone encoding or resolution is implied. |
+
+<Note>
+  A schema whose ID collides with one of these seven names — for example, a schema called `string` — cannot use the type shorthand and must use the canonical map form wherever its type is referenced.
+</Note>
+
+---
+
+## Field shorthand and canonical form
+
+Every field declaration has a canonical form (a map with `ty` and `optional`) and a shorthand form (a string). Both are valid in model files; the verifier always works with the canonical form internally.
+
+<CodeGroup>
+```yaml Shorthand (authoring)
+fields:
+  order_id: uuid             # scalar, required
+  note: string?              # scalar, optional (trailing ?)
+  customer: schema.Customer  # schema reference, required
+  items: [schema.LineItem]   # list of schema refs, required
+  tags: "[string]?"          # optional list (quotes needed for YAML)
+```
+
+```yaml Canonical form
+fields:
+  order_id:
+    ty:
+      kind: scalar
+      value: uuid
+    optional: false
+  note:
+    ty:
+      kind: scalar
+      value: string
+    optional: true
+  customer:
+    ty:
+      kind: schema
+      value: schema.Customer
+    optional: false
+  items:
+    ty:
+      kind: list
+      value:
+        kind: schema
+        value: schema.LineItem
+    optional: false
+  tags:
+    ty:
+      kind: list
+      value:
+        kind: scalar
+        value: string
+    optional: true
+```
+</CodeGroup>
+
+The shorthand is an authoring affordance only. Serialization always emits the canonical form.
+
+---
+
+## Optional fields
+
+Append `?` to any type in the shorthand to mark the field optional. In the canonical form, set `optional: true`.
+
+```yaml
+fields:
+  manifest_uri: string?      # may be absent
+  status: string             # always present
+```
+
+`optional: true` means the logical value may be absent. It is a schema-shape claim, not a runtime availability or liveness claim. An absent optional field is structurally permitted; whether it is populated at runtime depends on the implementation.
+
+<Warning>
+  `?` marks the *field* optional, not the type. Writing `[string?]` is an error. An optional list is written `"[string]?"` (the `?` is outside the brackets, and the whole value must be quoted for YAML).
+</Warning>
+
+---
+
+## List types
+
+Wrap any type in `[]` to declare a list of that type.
+
+```yaml
+fields:
+  # List of a scalar type
+  tags: "[string]"
+
+  # List of a schema reference
+  items: [schema.LineItem]
+
+  # Optional list (must be quoted for YAML to parse correctly)
+  attachments: "[uuid]?"
+```
+
+A list declaration does not imply uniqueness, sortedness, stable ordering across executions, bounded length, or set semantics. Those properties require additional declarations or constraints outside the type system.
+
+---
+
+## Schema references
+
+Reference another declared schema as a field type using the `schema.` prefix followed by the schema's ID.
+
+```yaml
+fields:
+  customer: schema.Customer
+  billing_address: schema.Address?
+  line_items: [schema.LineItem]
+```
+
+The `schema.` prefix in shorthand is the signal that a name is a schema reference rather than a scalar. Internally, the type is resolved by looking up the ID in the model's `schemas` map. Circular references are not permitted in fragment chains.
+
+---
+
+## Canonical schemas
+
+A `canonical` schema declares the full logical shape of a value.
+
+```yaml
+schemas:
+  schema.OrderCreated:
+    kind: canonical
+    completeness: complete
+    fields:
+      event_id: string
+      order_id: uuid
+      warehouse_id: uuid
+      sku: string
+      quantity: int
+      amount: decimal
+```
+
+<ParamField path="kind" type="string" required>
+  Must be `canonical`.
+</ParamField>
+
+<ParamField path="completeness" type="string" required>
+  Either `complete` or `partial`. See [Completeness](#completeness) below.
+</ParamField>
+
+<ParamField path="fields" type="map[string → Field]" required>
+  The fields of the schema. Keys are field names; values are type declarations in shorthand or canonical form.
+</ParamField>
+
+<ParamField path="description" type="string">
+  Optional prose documentation. Has no proof semantics; you may omit it.
+</ParamField>
+
+### Completeness
+
+<CardGroup cols={2}>
+  <Card title="complete" icon="check-circle">
+    The declaration describes the full logical schema. The verifier may treat any field not listed here as nonexistent. Use this when you own the schema and have listed all fields that matter to the model.
+  </Card>
+  <Card title="partial" icon="circle-half-stroke">
+    The real schema may contain undeclared fields. The verifier can reason about declared fields but must not infer that unlisted fields are absent. Use this for third-party schemas or when you only care about a subset of fields.
+  </Card>
+</CardGroup>
+
+The distinction matters for proofs that depend on exhaustive field knowledge. If you declare `completeness: complete` and the implementation adds a field you have not listed, the model no longer conforms and any proof that relied on exhaustive knowledge is invalidated.
+
+---
+
+## Fragment schemas
+
+A `fragment` schema is a projection over another declared schema. It introduces new field names that map to field paths in the source schema. The mapping asserts semantic identity: the fragment field and the source field path hold the same logical value, even if they are named differently.
+
+```yaml
+schemas:
+  schema.InventoryReserved:
+    kind: canonical
+    completeness: complete
+    fields:
+      event_id: string
+      order_id: uuid
+      warehouse_id: uuid
+      sku: string
+      quantity: int
+      amount: decimal
+
+  schema.ReservationSummary:
+    kind: fragment
+    source: schema.InventoryReserved
+    mapping:
+      id: order_id          # ReservationSummary.id == InventoryReserved.order_id
+      location: warehouse_id
+```
+
+<ParamField path="kind" type="string" required>
+  Must be `fragment`.
+</ParamField>
+
+<ParamField path="source" type="Id" required>
+  The ID of the source canonical schema.
+</ParamField>
+
+<ParamField path="mapping" type="map[string → FieldPath]" required>
+  Maps each fragment field name to a field path in the source schema. Field paths use dotted notation (e.g. `customer.id`) or the sequence form (e.g. `[customer, id]`). See [Field paths](#field-paths).
+</ParamField>
+
+A fragment does **not**:
+
+- create a new independent storage object,
+- imply that unmapped source fields are absent,
+- establish ordering or idempotency by itself, or
+- create a new independent value — it is a view.
+
+Fragment chains must remain acyclic and fully resolvable.
+
+---
+
+## Field paths
+
+A field path identifies a nested value relative to a schema. For example, `customer.id` means the `id` field inside a nested `customer` object.
+
+<CodeGroup>
+```yaml Dotted shorthand
+path: customer.id
+```
+
+```yaml Sequence form
+path:
+  - customer
+  - id
+```
+</CodeGroup>
+
+Both forms are equivalent. Use the sequence form when a path component itself contains a dot.
+
+A field path is valid only relative to the schema it is interpreted against. An empty path is a validation error. Diagnostics and error messages always render paths in dotted form.
+
+---
+
+## Real examples from the fixtures
+
+The following schemas are taken directly from the flash checkout fixture:
+
+```yaml
+schemas:
+  schema.CreateOrderRequest:
+    kind: canonical
+    completeness: complete
+    fields:
+      idempotency_key: string
+      order_id: uuid
+      warehouse_id: uuid
+      sku: string
+      quantity: int
+      amount: decimal
+
+  schema.RequestRejected:
+    kind: canonical
+    description: The err payload of a request the boundary refused.
+    completeness: complete
+    fields:
+      reason: string
+
+  schema.ChargeDeclined:
+    kind: canonical
+    description: The payment provider's err payload.
+    completeness: complete
+    fields:
+      reason: string
+
+  schema.StockRecord:
+    kind: canonical
+    completeness: complete
+    fields:
+      warehouse_id: uuid
+      sku: string
+      on_hand: int
+      reserved: int
+```
+
+And from the video streaming fixture, an optional field used for a nullable manifest URI:
+
+```yaml
+  schema.VideoRecord:
+    kind: canonical
+    description: Catalog state of one video.
+    completeness: complete
+    fields:
+      video_id: uuid
+      owner_id: uuid
+      source_uri: string
+      status: string
+      manifest_uri: string?   # absent until transcoding completes
+```
+
+<CardGroup cols={2}>
+  <Card title="Model Structure" icon="file-code" href="/dsl/model-structure">
+    Where schemas fit in the top-level model file
+  </Card>
+  <Card title="Value References" icon="link" href="/dsl/value-references">
+    How to reference fields from schemas in effects, transactions, and programs
+  </Card>
+</CardGroup>

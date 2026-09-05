@@ -1,0 +1,77 @@
+---
+title: "Conseqa: Formal Proofs for Microservice Correctness"
+sidebarTitle: "Introduction"
+description: "Learn what Conseqa is, which correctness properties it verifies, how its epistemic proof model works, and what the two CLI tools do."
+---
+
+Conseqa is a formal model checker for distributed microservices architectures. Distributed architectures accumulate subtle correctness problems — operations that silently execute twice, messages that arrive out of order, interrupted workflows that never resume — that are difficult to detect through testing alone. Conseqa lets you state your architecture in a YAML-based DSL and statically verify that the structure you've described actually satisfies the correctness properties you've declared. Every obligation comes back `proven`, `unknown`, or `disproven`, each backed by the facts the verifier relied on.
+
+## What Conseqa verifies
+
+Conseqa focuses on four families of correctness properties at the operation level:
+
+- **Serialization** — same-key invocations do not execute concurrently. Proved from topic ordering, dispatch routing, and lane concurrency facts.
+- **Ordering** — same-key invocations for which a meaningful logical precedence exists preserve that precedence through execution. Stronger than serialization: a non-FIFO mutex may serialize without ordering.
+- **Idempotency** — repeated attempts representing the same logical invocation do not cause externally distinguishable duplicate logical work. Proved across the full cascade: transactions, publications, outbound requests, and external effects.
+- **Recoverability** — the logical invocation reaches a valid terminal after any modeled interruption. A progress obligation, separate from idempotency.
+
+A model also carries an optional `result: replay_consistent` qualifier on an idempotency requirement, which asks the further question: do repeated admitted attempts return the same result variant and a replay-equivalent payload?
+
+## The two tools
+
+Conseqa ships two CLI binaries built from the same codebase.
+
+**`conseqa`** validates a YAML model for structural coherence and then verifies its declared requirements. Validation errors are fatal — verification is only meaningful over a coherent model. After a clean validation pass, the verifier discharges each declared obligation and prints a summary line:
+
+```text
+obligations: N proven, N unknown, N disproven (N total)
+```
+
+You can write a full JSON obligation report with `--report <PATH>` for downstream tooling or archiving.
+
+**`conseqa-viz`** renders your model as a single self-contained HTML file. It produces a system graph (services, operations, topics, external systems, and the edges between them), per-operation program drill-downs, and interactive state-machine graphs. Pass `--verify` to run the checker in-process and overlay obligation status directly on the visualization, or pass `--report <PATH>` to overlay a report you produced earlier. The HTML output makes no external network requests and can be opened directly from disk, attached to a pull request, or embedded in a design document.
+
+## The epistemic proof model
+
+Conseqa's verdicts are **epistemic**: they reflect what the verifier can establish from the declarations in your model, not assertions about runtime behavior.
+
+| Verdict | Meaning |
+|---|---|
+| `proven` | The property follows from the declared facts and architecture. |
+| `unknown` | The verifier could not establish the property — typically because a required fact is `unspecified` or no verifier covers that property family in V1. |
+| `disproven` | The verifier found a structural counterexample. |
+
+<Warning>
+  `unknown` is never evidence of a violation. It means the model provides no fact from which the property can be inferred. Do not read an `unknown` obligation as "this operation is broken."
+</Warning>
+
+This epistemic stance carries through to the DSL itself. `unspecified` on a topic's ordering, a transaction's idempotency, or a subscription's delivery does not mean the property is false — it means the model provides no usable fact. Absence of a guarantee is not evidence of a violation, and the verifier never infers one from silence.
+
+### Conditional proofs
+
+Every proof Conseqa produces is conditional on the real implementation satisfying the declarations used by the proof. A proof that relies on `serializable` transaction isolation, a `deduplicated_by` external boundary, or `at_least_once` delivery is invalid if the concrete implementation does not actually provide those semantics. Conseqa verifies structure; conformance to the model is your responsibility.
+
+## How the DSL describes your architecture
+
+A Conseqa model is a YAML file with a fixed set of top-level keys:
+
+| Key | Purpose |
+|---|---|
+| `revision` | Opaque numeric revision marker for the model snapshot. |
+| `services` | Logical ownership boundaries for operations. Kinds: `backend`, `frontend`, `worker`, `job`. |
+| `schemas` | Logical value shapes. Kinds: `canonical` (with `fields`) and `fragment` (a projection of another schema). |
+| `data_models` | Logical transactional state boundaries containing persistent objects. |
+| `topics` | Message channels with declared ordering and identity guarantees. |
+| `state_machines` | Object lifecycle graphs with declared transitions and side effects. |
+| `operations` | Units of application behavior: inputs, effects, transactions, a program, and requirements. |
+
+A structurally valid model is not necessarily a safe one. Validation establishes coherence; verification establishes whether requirements follow from the declared facts.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Write and verify your first model in minutes.
+  </Card>
+  <Card title="Core Concepts" icon="shapes" href="/concepts/model-overview">
+    Deep-dive into operations, requirements, and the proof mechanics.
+  </Card>
+</CardGroup>

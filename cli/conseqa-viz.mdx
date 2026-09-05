@@ -1,0 +1,171 @@
+---
+title: "conseqa-viz — Architecture Visualization Generator"
+sidebarTitle: "conseqa-viz"
+description: "Run conseqa-viz <MODEL.yaml> to generate a self-contained interactive HTML visualization of your architecture, optionally overlaid with proof verdicts."
+---
+
+`conseqa-viz` turns a Conseqa YAML model into a single self-contained HTML file you can open in any browser, attach to a pull request, or share with your team. The output makes no network requests and works fully offline. When you add a prover report — either by pointing to an existing one or by running the model checker inline — the visualization colors every operation, topic, and state machine by its worst obligation status.
+
+```bash
+conseqa-viz model.yaml
+conseqa-viz model.yaml --verify --out model.html --title "checkout architecture"
+conseqa-viz model.yaml --report proof.json --out model.html
+```
+
+## Arguments and Options
+
+<ParamField path="MODEL.yaml" type="string" required>
+  Path to the YAML model file to visualize. Validation runs before rendering;
+  diagnostics go to stderr and rendering proceeds regardless. Use `--no-validate`
+  to suppress the validation pass.
+</ParamField>
+
+<ParamField path="--out PATH" type="string">
+  Output path for the generated HTML file. Defaults to `<MODEL>.html` — the
+  same base name as the input, with the extension replaced. For `--example-report`
+  with no `--out`, output goes to stdout.
+</ParamField>
+
+<ParamField path="--report PATH" type="string">
+  Load a prover report JSON file and overlay its obligation verdicts on the
+  visualization. Mutually exclusive with `--verify`. Use this when you have a
+  report produced by a previous `conseqa --report` run. If the report's
+  `model_revision` does not match the current model, a warning is printed to
+  stderr and rendering continues.
+</ParamField>
+
+<ParamField path="--verify" type="flag">
+  Run the model checker in-process and overlay the resulting obligation report
+  on the visualization. Mutually exclusive with `--report`. This is the
+  equivalent of running `conseqa --report` and `conseqa-viz --report` in one
+  step.
+</ParamField>
+
+<ParamField path="--json" type="flag">
+  Emit the page data — title, model, derived graph, and report — as JSON
+  instead of rendering HTML. Intended for the front-end development server and
+  custom tooling. The output is the same data the HTML bundle would receive as
+  `window.CONSEQA`.
+</ParamField>
+
+<ParamField path="--title TITLE" type="string">
+  Page title shown in the browser tab and the visualization's top bar. Defaults
+  to the model file's stem (the filename without path or extension).
+</ParamField>
+
+<ParamField path="--example-report" type="flag">
+  Instead of rendering, emit a scaffold prover report that enumerates every
+  obligation implied by the model's declared requirements, with every status set
+  to `unknown`. Useful for understanding the report format, annotating
+  obligations manually, or bootstrapping a custom report. Output goes to stdout
+  unless `--out` is given.
+</ParamField>
+
+<ParamField path="--no-validate" type="flag">
+  Skip the validation pass. Diagnostics from the analyzer are suppressed. The
+  model is rendered regardless of structural errors, which is useful for
+  inspecting a work-in-progress model.
+</ParamField>
+
+<ParamField path="-h, --help" type="flag">
+  Print usage information and exit.
+</ParamField>
+
+## The HTML Output
+
+The generated file is fully self-contained: every script and stylesheet is inlined, no fonts or assets are fetched at runtime, and the file opens directly from disk without a local server. Graph layouts are rendered as SVG in the browser.
+
+The visualization supports dark and light mode, toggled from the top bar.
+
+## Three Views
+
+The visualization presents your architecture across three navigable views.
+
+<CardGroup cols={2}>
+  <Card title="System View" icon="diagram-project">
+    The top-level architecture graph. Services appear as boundary boxes containing
+    their operations; topics, external systems, and a synthetic "clients" vertex
+    sit around them. Edges show publications (operation → topic), subscriptions
+    (topic → operation), request effects (operation → operation), and external
+    effects. Dashed edges are declared-but-unexecuted capabilities.
+  </Card>
+  <Card title="Operation View" icon="code">
+    A full drill-down into one operation: requirements table with verdict chips
+    when a report is loaded, inputs table with delivery and dispatch semantics,
+    and the operation's program rendered as a step-by-step flow diagram.
+    Transaction steps expand in place to show reads, writes, inserts, transitions,
+    and artifact establishments.
+  </Card>
+  <Card title="State Machine View" icon="circle-nodes">
+    The state graph for one state machine: legal states, the initial state,
+    transitions with side-effect counts, and a transitions table listing
+    from/to sets, side effects, and the operations that execute each transition.
+    Selecting a transition updates the URL so you can share deep links.
+  </Card>
+</CardGroup>
+
+When a report is loaded, every vertex gains a status ring and a rollup chip (worst status wins: `disproven` > `unknown` > `proven`). Requirement rows in the operation view are colored by their obligation status, and the top bar's **Obligations** button opens a filterable panel of all obligations grouped by subject.
+
+## Example Invocations
+
+<CodeGroup>
+```bash Basic visualization
+conseqa-viz flash_checkout.yaml
+# wrote flash_checkout.html
+```
+</CodeGroup>
+
+<CodeGroup>
+```bash Run the model checker and overlay results
+conseqa-viz flash_checkout.yaml --verify \
+  --out flash_checkout.html \
+  --title "Flash Checkout Architecture"
+# wrote flash_checkout.html
+```
+</CodeGroup>
+
+<CodeGroup>
+```bash Overlay a previously produced report
+conseqa flash_checkout.yaml --report proof.json
+conseqa-viz flash_checkout.yaml --report proof.json --out flash_checkout.html
+# wrote flash_checkout.html
+```
+</CodeGroup>
+
+<CodeGroup>
+```bash Scaffold a report for manual annotation
+conseqa-viz flash_checkout.yaml --example-report --out scaffold.json
+# (writes JSON scaffold to scaffold.json)
+conseqa-viz flash_checkout.yaml --report scaffold.json --out flash_checkout.html
+```
+</CodeGroup>
+
+<CodeGroup>
+```bash Emit page data as JSON (for front-end development)
+conseqa-viz flash_checkout.yaml --verify --json --out page-data.json
+```
+</CodeGroup>
+
+<CodeGroup>
+```bash Inspect a work-in-progress model without validation noise
+conseqa-viz wip_model.yaml --no-validate
+# wrote wip_model.html
+```
+</CodeGroup>
+
+## Mutual Exclusion: `--verify` and `--report`
+
+`--verify` and `--report` are mutually exclusive. Both produce an obligation overlay; they differ only in where the report comes from. Use `--verify` when you want a single command that checks and visualizes in one step. Use `--report` when you have a report from CI, a prior `conseqa` run, or another tool, and want to visualize it separately.
+
+```bash
+# These two are equivalent in effect:
+conseqa-viz model.yaml --verify --out model.html
+
+conseqa model.yaml --report proof.json
+conseqa-viz model.yaml --report proof.json --out model.html
+```
+
+<Note>
+  Passing both flags at once is an error: `conseqa-viz` will exit with
+  `--verify and --report are mutually exclusive`.
+</Note>
