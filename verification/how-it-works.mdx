@@ -1,90 +1,101 @@
 ---
-title: "How Conseqa Verifies Your Architecture: Two-Phase Process"
+title: "How Conseqa Verifies Models: Validation, Forward Analysis, and Fixpoints"
 sidebarTitle: "How It Works"
-description: "Conseqa validates your model's structure, then verifies each declared requirement across five families, producing a proven, unknown, or disproven verdict."
+description: "Conseqa validates structural coherence, then verifies each declared requirement using forward definite-availability analysis, per-admitted-path reasoning, and greatest-fixpoint computation across the request/publication/outbox cascade."
 ---
 
-Conseqa verifies your architecture model in two sequential phases. First it validates the structural coherence of your YAML declarations. If that passes, it runs the verification engine to prove — or report as unproven — each correctness requirement you have declared. The result is a set of obligation verdicts: `proven`, `unknown`, or `disproven`.
+Conseqa verifies your architecture model in two sequential phases. First it validates structural coherence. If that passes, it runs the verification engine over every declared requirement. The result is a set of obligation verdicts, each recording whether the proof relied only on the abstract application machine (`scope: l0_only`) or also consumed runtime topology facts (`scope: runtime_dependent`).
 
 ## Phase 1: Validation
 
-Validation checks that your model is structurally coherent before any proof attempt. It resolves every reference, confirms that all declared IDs exist, checks that field paths resolve against their schemas, and verifies program termination and definite artifact availability.
+Validation checks that your model is structurally coherent before any proof attempt. It resolves every reference, confirms that all declared IDs exist, checks that field paths resolve against their schemas, verifies program termination, and confirms that every artifact a step consumes is definitely available on every incoming path.
 
 <Warning>
-Validation is fatal. If any validation error exists, verification is skipped entirely and Conseqa exits with a failure code. Fix all validation errors before expecting obligation verdicts.
+  Validation is fatal. If any validation error exists, verification is skipped entirely and Conseqa exits with a failure code. Fix all validation errors before expecting obligation verdicts.
 </Warning>
 
-Validation errors are printed to stderr, each with a subject ID and a message explaining the structural problem. Common causes include broken cross-references (a transaction referencing an undeclared data model), program paths that never reach a terminal (`return` or `complete`), and transaction artifacts consumed before they are established on every incoming path.
+Validation errors are printed to stderr, each with a subject ID and a message explaining the structural problem. Common causes include broken cross-references, program paths that never reach a terminal (`return` or `complete`), and artifacts consumed before they are established on every incoming path.
 
 ## Phase 2: Verification
 
 Once a model is structurally valid, the verification engine analyzes each declared requirement and produces a verdict. Verification proceeds across five families:
 
 <CardGroup cols={2}>
-  <Card title="Serialization" icon="lock">
-    Proves that same-key invocations of an operation never overlap. Evidence comes from concurrency bounds, single-lane dispatch, or the combination of keyed topic ordering, `by_topic_key` dispatch, and `bounded(1)` lane concurrency.
-  </Card>
-  <Card title="Ordering" icon="arrow-down-1-9">
-    Proves that same-key invocations execute in their semantic precedence order. Requires both a precedence source (keyed or global topic ordering) and an execution mechanism (same-lane dispatch with `bounded(1)` concurrency) that preserves it.
-  </Card>
   <Card title="Idempotency" icon="rotate">
-    Proves that repeated attempts at the same logical invocation produce no externally distinguishable duplicate work. Analysis follows cascades: a publication is only safe if every modeled consumer collapses duplicates; a request effect is only safe if the target operation proves its own idempotency.
+    Proves that repeated attempts at the same logical invocation produce no externally distinguishable duplicate work. Analyzed per admitted path across three legs: state, effect, and control. The effect leg follows the cascade through publications, requests, external effects, and outbox writes. An outbox boundary does not terminate the causal graph.
   </Card>
+
+  <Card title="Result Replay" icon="arrow-right-arrow-left">
+    Proves that repeated attempts return the same result variant and a replay-equivalent payload, for requirements that declare `result: replay_consistent`.
+  </Card>
+
+  <Card title="Serialization" icon="lock">
+    Proves that same-key invocations of an operation never overlap. Evidence comes from routing, single-owner member assignment, and `ExecutionPool.member_concurrency = bounded(1)`.
+  </Card>
+
+  <Card title="Ordering" icon="arrow-down-1-9">
+    Proves that same-key invocations execute in their semantic precedence order. Requires both a precedence source and a mechanism that preserves it.
+  </Card>
+
   <Card title="Recoverability" icon="arrow-rotate-right">
-    Proves that an interrupted invocation can be resumed and driven to a terminal (`return` or `complete`). Analyzes whether every transaction on a path resolves on re-encounter and whether all artifacts a path consumes are available on resumption.
+    Proves that an interrupted invocation can be resumed and driven to a terminal (`return` or `complete`). A progress obligation, distinct from idempotency.
   </Card>
 </CardGroup>
 
-A fifth family, **result replay**, is analyzed alongside idempotency for any requirement that declares `result: replay_consistent`. It proves that every attempt in the same idempotency class returns the same result variant and a replay-equivalent payload.
-
 ## How Each Family Is Proved
+
+### Idempotency: greatest-fixpoint (coinductive) analysis
+
+Idempotency analysis evaluates every **admitted program path** (each path ending at `complete` or at a `return` for the triggering input) under the governing key's population. Three legs must hold on every admitted path:
+
+- **State leg:** Every transaction step must be retry-safe, either through a `deduplicated_by` keyed commit or through natural replayability derived from deterministic provenance.
+- **Effect leg:** Every effect-executing step must be duplicate-safe. A publication is safe when the topic (or outbox) carries a keyed message identity for the published schema and every modeled consumer proves idempotency for that input. A request effect is safe when the target operation proves idempotency keyed from the targeted input. An external effect is safe when it declares `deduplicated_by` over a replay-stable key. An outbox write is safe when its containing transaction suppresses a second commit, or when every modeled consumer of the outbox collapses duplicate deliveries. The cascade continues through every outbox input admitting the written schema: an outbox boundary does not terminate the causal graph.
+- **Control leg:** Every decision on the path must replay. The branch condition must be deterministic over replay-stable roots, or the matched result must be replay-stable.
+
+Because idempotency verdicts are mutually dependent across operations (a request effect's safety depends on the target's verdict, which may in turn depend on the caller's), the engine computes all idempotency verdicts as a **greatest fixpoint**: every requirement with an admissible governing key is initially assumed proven, and requirements that fail under that assumption are dropped until nothing more fails. A cycle of requirements that each pass their local checks under the mutual assumption is marked **coinductive** in the report. The same greatest-fixpoint computation applies to result-replay verdicts through request effects.
+
+Vacuously discharged cases include: an empty population; no admitted path; and a triggering subscription or outbox input with `at_most_once` delivery whose payload is identity-pinned by the key.
 
 ### Serialization
 
-Serialization — same-key invocations must not overlap — is proven from one of three structural patterns:
+Serialization (same-key invocations must not overlap) is proven from one of four routes:
 
-1. **Concurrency bound:** `execution.concurrency: bounded(1)` on the operation itself caps global active invocations to one.
-2. **Single-lane dispatch:** a subscription with `dispatch.routing: single_lane` and `lane_concurrency: bounded(1)` funnels all deliveries through one non-overlapping lane.
-3. **Keyed lane isolation:** a keyed topic ordering + `by_topic_key` dispatch + `lane_concurrency: bounded(1)` ensures that same-key deliveries enter one lane and cannot overlap.
-
-Pattern 3 is the most common for event-driven operations. It provides serialization per key — different keys may still execute in parallel.
+1. **Vacuous population:** The key's message-driven input admits no message schemas, so the constrained population is empty by declaration. This is the only `l0_only` route.
+2. **Request-routed:** A `Router` serves the key's request boundary, every component of its semantic routing key carries the same logical value as the requirement key, its `MemberAssignment` gives that domain one active owning member (including through handoff), and the target pool declares `member_concurrency = bounded(1)`.
+3. **Subscription-routed:** The same argument on the delivery side, with `key: grouping_key` naming the effective grouping domain and the requirement key established to carry the grouping key for every admitted schema.
+4. **Outbox-routed:** The same argument over an outbox input's keyed partitioning. Every partition-key component carries the requirement key for every admitted schema, the dispatch's `MemberAssignment` gives each partition one active owning member, the pool is serial, **and the dispatch declares no batching stage**. A declared batching stage stops the route: batch-internal overlap is intentionally unmodeled, and `member_concurrency` must not be silently read as a fact about it.
 
 ### Ordering
 
-Ordering requires serialization plus a proven semantic precedence. The V1 engine recognizes one precedence source: the delivery order a keyed or global topic guarantees for same-key messages. A lane dispatches in delivery order and re-dispatches a failed delivery at the head of the lane before any later message, so `bounded(1)` concurrency prevents overtaking.
+Ordering requires serialization plus a proven semantic precedence. The V1 engine recognizes two precedence sources:
 
-A serialization mechanism alone (such as a non-FIFO lock) cannot prove ordering if it does not preserve the topic's delivery sequence.
+- Transport ordering (`within_group` or `global`) for a subscription-triggered key.
+- Outbox runtime ordering (`partition` or `global`) for an outbox-triggered key.
 
-### Idempotency: Greatest-Fixpoint Analysis
+A request input has no precedence source at all. Arbitrarily serializing concurrent inputs can satisfy a serialization requirement but cannot invent a semantic precedence required by an ordering proof.
 
-Idempotency analysis is the most involved of the five families. The engine evaluates every admitted program path — each path ending at `complete` or at a `return` for the triggering input — and checks three legs:
+Dispatch preserves precedence and never creates it, so the proof is the serialization argument plus the precedence: the requirement key is established to be the effective grouping (or partition) key, `key: grouping_key` routes by that same domain, `MemberAssignment` gives it one active owning member, and `member_concurrency = bounded(1)` stops a later invocation overtaking an earlier one.
 
-- **State leg:** every transaction step must be retry-safe, either through a `deduplicated_by` keyed commit or through natural replayability derived from deterministic provenance.
-- **Effect leg:** every effect execution must be duplicate-safe. A publication is safe when the topic carries a keyed message identity for the published schema and every modeled consumer has a proven idempotency requirement. A request effect is safe when the target operation proves idempotency keyed from the targeted input. An external effect is safe when it declares `deduplicated_by` over a key that is replay-stable relative to the governing key.
-- **Control leg:** every decision on the path must replay — the branch condition must be deterministic over replay-stable roots, or the matched result must be replay-stable.
-
-Because idempotency verdicts are mutually dependent across operations (a request effect's safety depends on the target's verdict, which may in turn depend on the caller's), the engine computes all idempotency verdicts as a **greatest fixpoint**: every requirement with an admissible governing key is initially assumed proven, and requirements that fail under that assumption are dropped until nothing more fails. A cycle of requirements that each pass their local checks under the mutual assumption is marked **coinductive** in the report.
+For the outbox route, a declared **batching stage** is judged explicitly. Absent batching, there is no obstacle. `batching.ordering: preserved` lets the established precedence pass through the stage. `batching.ordering: unspecified` stops the proof, because the stage then provides no evidence the order survives execution. Order preservation is an ordering fact only: it is never read as a no-overlap guarantee, which is why the serialization route refuses batching outright while the ordering route accepts `preserved`.
 
 ### Recoverability
 
-Recoverability analysis asks whether a resumed invocation can reach a terminal for every admitted path. It checks that every transaction on a path resolves on re-encounter (by keyed commit recovery or natural replay) and that every artifact the path consumes — effect intents, transaction outputs — is available on resumption via the same two routes. Unlike idempotency, decisions are never obstacles: a retry may take any admitted path, and each path is analyzed independently.
+Recoverability analysis asks whether a resumed invocation can reach a terminal for every admitted path. It checks that every transaction on a path resolves on re-encounter (by keyed commit recovery or natural replay) and that every artifact the path consumes (effect intents, transaction outputs) is available on resumption via the same two routes. Unlike idempotency, decisions are never obstacles: a retry may take any admitted path, and each path is analyzed independently.
 
-`completion: resumable` requires that resumption be *possible*. `completion: guaranteed` additionally requires a modeled retry driver — such as `delivery: at_least_once` on the triggering subscription or a `may_repeat` inbound request effect.
+`completion: resumable` requires that resumption be possible. `completion: guaranteed` additionally requires a modeled retry driver: `delivery: at_least_once` on the triggering subscription's runtime or outbox input's runtime (L1 facts, so the proof is `runtime_dependent`), or an inbound `RequestEffect` whose `retry` is `may_repeat` (an L0 guarantee, so the proof stays `l0_only`).
 
-## Verdicts Are Epistemic
+## What happens when L1 is removed
+
+Deleting the `runtime` block from a valid model leaves it valid. Requirements discharged from runtime facts become **unproven** — never violated, and never a structural error. That asymmetry is the point of the layering: L0 stands alone, and L1 is what a particular realization adds. Every proof records its scope so you can identify which obligations would revert to unproven when runtime declarations change.
+
+## Verdicts are epistemic
 
 Every verdict is an epistemic statement about declared facts, not an observation of runtime behavior:
 
-- **`proven`** means the declared facts are sufficient to establish the property. The proof is conditional on the implementation conforming to those declarations.
+- **`proven`** means the declared facts are sufficient to establish the property. The proof is conditional on the implementation conforming to those declarations. The proof's scope (`l0_only` or `runtime_dependent`) records which semantic layers were consumed.
 - **`unknown`** means the declared facts are insufficient to prove or disprove the property. It is not evidence of a violation.
 - **`disproven`** means a counterexample exists within the declared model.
 
-`unspecified` in any declaration means "no fact is provided." It does not mean the property is false, and it cannot contribute to any proof.
-
-## Model-Wide Notes
-
-After verification, Conseqa may raise model-wide notes that are not tied to a specific obligation. The most common: a subscription that admits `at_least_once` delivery while the operation declares no idempotency requirement keyed from that subscription. This is not an error — it may be intentional — but it is flagged because duplicate deliveries are admitted and no requirement asks the verifier to check that they are handled.
-
-<Tip>
-These notes appear alongside obligation output. In `conseqa-viz`, they appear at the top of the obligations panel when a report is loaded.
-</Tip>
+<Warning>
+  `unknown` is never evidence of a violation. It means the model provides no fact from which the property can be inferred. Do not read an `unknown` obligation as "this operation is broken."
+</Warning>

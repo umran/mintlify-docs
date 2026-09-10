@@ -1,0 +1,133 @@
+---
+title: "L1 Runtime Topology: How the Abstract Machine Runs"
+sidebarTitle: "Overview"
+description: "Learn how Conseqa L1 runtime topology bridges the abstract application machine to realization facts like routing, pools, and transport ordering."
+---
+
+Conseqa separates the abstract application machine (L0) from runtime realization facts (L1). L0 declares services, schemas, topics, state machines, operations, and requirements. L1 lives under `Model.runtime` and declares how that machine is wired to execution topology, transport behavior, and storage layout. This page introduces the L1 layer, explains why it is optional, and maps the declarations you can place inside `runtime`.
+
+<Note>
+  L1 is entirely optional. Removing `runtime` from a valid model never makes it invalid. Proofs that required L1 facts simply become unproven; they do not become violations or structural errors.
+</Note>
+
+## What L1 declares
+
+L1 describes selected qualitative facts about realization:
+
+- **Transport ordering and grouping** for topics
+- **Subscription delivery, dispatch, and routing**
+- **Request routing** into execution pools
+- **Execution topology and concurrency**
+- **Storage partitioning**
+
+A realization fact belongs in L1 when it changes what the realization does and is qualitative, not a number. Numbers such as pool cardinality, CPU cores, traffic rates, and host counts stay outside in the external simulation scenario. Correctness relevance does not determine layer: `serializable` isolation is L0, while execution member concurrency is L1.
+
+## Proof scope
+
+Every successful proof records whether it consumed L1 facts:
+
+| Scope | Meaning |
+| --- | --- |
+| `l0_only` | No explicit L1 fact was required. |
+| `runtime_dependent` | At least one L1 fact was necessary. |
+
+Deleting L1 turns `runtime_dependent` proofs into unproven, never into violations. The scope records a dependency, not a weakness. A proof resting on `serializable` is `l0_only` and still assumes the database implements it.
+
+## Layout under `Model.runtime`
+
+```yaml
+runtime:
+  topics:            <topic id>       -> TopicRuntime
+  subscriptions:     <operation id>   -> <input id> -> SubscriptionRuntime
+  outboxes:          <operation id>   -> <input id> -> OutboxRuntime
+  execution_pools:   <pool id>        -> ExecutionPool
+  routers:           <router id>      -> Router
+  storage_layouts:   <layout id>      -> StorageLayout
+```
+
+Every L1 identifier lives in the same global namespace as L0 identifiers.
+
+## Routing concept
+
+Routing has two semantic components, independent dimensions rather than alternative modes:
+
+```text
+invocation
+    |  evaluate semantic routing key
+    v
+routing domain
+    |  member assignment
+    v
+execution-pool member
+```
+
+A routing key defines routing-domain identity. A member assignment maps domains onto pool members. The domain keeps its identity across rebalances.
+
+<Warning>
+  Operations no longer declare `execution.concurrency`. All runtime execution concurrency lives in exactly one place: `ExecutionPool.member_concurrency`. There is no `OperationRuntime`, no lane abstraction, and no lane concurrency anywhere in the model.
+</Warning>
+
+## Compact `runtime` skeleton
+
+```yaml
+runtime:
+  topics:
+    topic.order_events:
+      grouping:
+        schema.OrderCreated:
+          - account_id
+      ordering: within_group
+  subscriptions:
+    op.process_order:
+      input.sub_order_events:
+        delivery: at_least_once
+        dispatch:
+          pool: pool.order_workers
+  outboxes:
+    op.publish_order_event:
+      input.outbox_order_created:
+        delivery: at_least_once
+        dispatch:
+          pool: pool.outbox_workers
+  execution_pools:
+    pool.order_workers:
+      member_concurrency:
+        kind: bounded
+        value: 1
+  routers:
+    router.update_account:
+      boundary:
+        operation: op.update_account
+        input: input.request
+      pool: pool.order_workers
+      routing:
+        key:
+          - account_id
+        member_assignment:
+          kind: consistent_hash
+  storage_layouts:
+    layout.orders:
+      object:
+        data_model: data.orders
+        object: obj.order
+      partition_key:
+        - tenant_id
+```
+
+<CardGroup>
+  <Card title="Topic & Subscription Runtime" icon="layers" href="/runtime/topic-and-subscription-runtime">
+    Declare transport grouping, ordering, delivery, and dispatch.
+  </Card>
+
+  <Card title="Outbox Runtime" icon="inbox" href="/runtime/outbox-runtime">
+    Declare partitioning, ordering, and dispatch for outbox consumers.
+  </Card>
+
+  <Card title="Routers & Pools" icon="server" href="/runtime/routers-and-pools">
+    Route requests into pools and declare per-member concurrency.
+  </Card>
+
+  <Card title="Storage Layouts" icon="database" href="/runtime/storage-layouts">
+    Map logical objects to storage partitions.
+  </Card>
+</CardGroup>

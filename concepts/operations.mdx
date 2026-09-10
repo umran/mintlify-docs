@@ -1,39 +1,30 @@
 ---
-title: "Operations: Inputs, Program, and Requirements in Conseqa"
+title: "Conseqa Operations: Inputs, Programs, and Effects"
 sidebarTitle: "Operations"
-description: "An operation is a logical unit of behavior in your system. Learn how to declare inputs, a causal program of inline transactions and effects, and correctness requirements."
+description: "Operations are logical units of behavior with request, subscription, and outbox inputs. No operation-level concurrency exists; runtime concurrency lives in ExecutionPool.member_concurrency."
 ---
 
-An operation is the primary modeling unit in Conseqa. It represents a single logical unit of behavior owned by one service, for example creating an order, reserving inventory, transcoding a video, or sending a notification. You declare what triggers the operation, one explicit causal program that runs when it is invoked, and the correctness properties it must satisfy. The verifier then determines whether those properties actually follow from what you declared.
-
-<Note>
-  Transactions, direct effects, effect intents, and transaction outputs are declared inline at the program or transaction site that executes or establishes them. They are not predeclared as operation-level registries.
-</Note>
-
-<Note>
-Declaring a requirement on an operation does not assert that the operation satisfies it. The verifier must prove, disprove, or report an unknown verdict independently.
-</Note>
+An operation is a logical unit of application behavior owned by one service. It declares possible invocation sources, one explicit causal program, and requirements. Everything created during execution (transactions, effects, outputs, intents, async handles) is declared inline at the site that creates it.
 
 ## Operation fields
 
-Every operation belongs to exactly one service and contains the following fields:
+An operation contains exactly these fields:
 
-| Field | Purpose |
-|---|---|
-| `service` | The owning service ID |
-| `description` | Documentation string (no proof semantics) |
-| `inputs` | One or more invocation sources (request or subscription) |
-| `program` | The single explicit causal control-flow structure. Inline transactions, direct effects, effect intents, and transaction outputs live inside it |
-| `requirements` | Correctness obligations declared on this operation |
-| `execution.concurrency` | Global invocation concurrency fact |
+- **`service`** : The owning service.
+- **`description`** : Documentation only; no proof semantics.
+- **`inputs`** : Possible invocation sources. See the three input kinds below.
+- **`program`** : The single explicit causal control structure.
+- **`requirements`** : Proof obligations the verifier must discharge.
 
-## Inputs
+<Warning>
+  There is **no** `execution.concurrency` field on an operation. Runtime concurrency is declared exclusively by `ExecutionPool.member_concurrency` in the optional L1 runtime layer.
+</Warning>
 
-An input is a possible source of an invocation. An operation may declare multiple inputs; a concrete invocation is associated with the one that triggered it. There are two input kinds.
+## Three input kinds
 
-### Request inputs
+### Request input
 
-A request input declares a directly invoked operation, think of it as a synchronous API endpoint. It carries a `schema` for the request payload, an optional `identity` declaration, and a `result` contract.
+A request input declares a directly invoked operation input and the schema of its payload.
 
 ```yaml
 inputs:
@@ -43,320 +34,153 @@ inputs:
     identity:
       kind: keyed
       fields:
-        - idempotency_key
+        - request_id
     result:
       ok: schema.CreateOrderResponse
-      err: schema.RequestRejected
+      err:
+        schema: schema.RequestRejected
+        disposition: unspecified
 ```
 
-**`identity`** declares where the logical identity of one request lives in the payload. `keyed` with a list of fields means: any two requests arriving at this input with equal values at those fields present equal payloads. This is an implementation guarantee that lets the verifier pin payload fields as replay-stable. `unspecified` provides no such fact.
+`identity` declares where the identity of one logical request lives in the payload. `keyed` guarantees that any two requests whose identity field values are equal present equal payloads. `unspecified` provides no such fact.
 
-**`result`** declares the `Result<Ok, Err>` contract the request returns. The `err` side may include a `disposition`:
+`result` declares the `Result<Ok, Err>` contract returned by this input. `disposition` is `terminal`, `retryable`, or `unspecified`.
 
-- `terminal` — observing this error terminally resolves the logical interaction
-- `retryable` — observing this error ends the current attempt but admits another
-- `unspecified` — no usable fact about terminality or retryability
+### Subscription input
 
-### Subscription inputs
-
-A subscription input declares invocation from a topic. The operation is invoked once per delivered message matching the declared schema selection.
+A subscription declares invocation from a topic.
 
 ```yaml
 inputs:
-  input.reserve_inventory.created:
+  input.order_created:
     kind: subscription
     topic: topic.order_events
-    messages:
-      kind: only
-      schemas:
-        - schema.OrderCreated
-    delivery: at_least_once
-    dispatch:
-      routing: by_topic_key
-      lane_concurrency:
-        kind: bounded
-        value: 1
+    messages: all
+    acknowledge_on_success: true
 ```
 
-**`messages`** selects which topic schemas trigger this subscription. `kind: all` admits every schema the topic carries; `kind: only` restricts to the listed schemas.
+Its L0 content is the topic and the selected message schemas. It does **not** carry `delivery` or `dispatch`; those are L1 facts declared in a `SubscriptionRuntime`.
 
-**`delivery`** declares the duplicate/loss guarantee:
+### Outbox input
 
-| Value | Meaning |
-|---|---|
-| `at_least_once` | A successfully published message may be delivered more than once; duplicate invocations are possible |
-| `at_most_once` | The same logical message is delivered no more than once; loss may occur |
-| `unspecified` | No duplicate or loss fact is available |
+An outbox input declares invocation from a committed outbox message.
 
-**`dispatch.routing`** controls lane affinity:
+```yaml
+inputs:
+  input.publish_order_event:
+    kind: outbox
+    outbox: outbox.order_events
+    messages:
+      - schema.OrderCreated
+      - schema.OrderPaid
+    acknowledge_on_success: true
+```
 
-| Value | Meaning |
-|---|---|
-| `by_topic_key` | Deliveries sharing the topic's ordering key enter the same lane |
-| `single_lane` | Every delivery for this subscription enters one lane |
-| `unconstrained` | No useful affinity between related deliveries is guaranteed |
-| `unspecified` | No lane-affinity fact is available |
-
-**`dispatch.lane_concurrency`** controls how many invocations from the same lane may run simultaneously. `bounded(1)` is the important case for serializing same-key execution.
+Its L0 content is the outbox, the selected message schemas, and an explicit `acknowledge_on_success` declaration. Like subscriptions, it carries no delivery or dispatch facts; those live in an `OutboxRuntime`.
 
 ## The program
 
-`program` is the operation's single explicit control structure, an ordered block of steps in which decisions nest further blocks, and every reachable path ends at `return` (for request inputs) or `complete` (for subscription inputs). The program is acyclic by construction.
+`operation.program` is the operation's single control structure: a block of steps executed in order, with `match_result` and `branch` decisions nesting further blocks. Every reachable path ends at `return` (for a request input) or `complete` (returning nothing).
 
-Inline transactions, direct effects, and effect intents are declared at the site that executes or establishes them. There is no separate operation-level registry for them.
+The structure is acyclic by construction: no loops exist. Asynchronous effect steps may initiate effect executions whose lifetimes overlap later control, and `join_all` / `race` add explicit completion dependencies, but the operation remains a control-flow DAG plus effect-completion edges.
+
+Control flow describes causality. It is not a durable workflow, a checkpoint, or a program counter: a retry traverses the same declared control from the first step, and what it re-encounters is judged by transaction and effect replay rules.
+
+<Info>
+  For details on async effect steps and synchronization, see [Async effects](/dsl/async-effects). For the full program step vocabulary, see [Program control](/dsl/program-control).
+</Info>
+
+## Stable execution-site IDs versus bindings
+
+Two kinds of names arise from inline declarations, and they are not the same thing.
+
+**Stable execution-site IDs** identify the inline declaration itself:
+
+- `Transaction.id`
+- `ExecuteEffect.effect_id`
+- `EstablishEffectIntent.effect_id`
+
+These IDs do not reference another declaration. They are used for keyed commit identity, value lineage, diagnostics, conformance, proof evidence, and visualization. A step's location in the program is not a substitute: moving an inline transaction must not silently change its durable commit identity.
+
+**Bindings** name something produced by execution:
+
+- a transaction read observation
+- a transaction output artifact
+- an effect-intent artifact
+- an effect result observation
+- an async handle
+
+Bindings are immutable, single-producer, operation-local, and scoped by program and transaction structure. There is no rebinding, no shadowing, and no forward reference.
+
+An async launch therefore carries two independently meaningful names: `effect_id`, the stable identity of the inline effect occurrence, and `handle`, an invocation-local synchronization artifact naming one asynchronous execution occurrence.
+
+## Compact example
 
 ```yaml
-program:
-  steps:
-    - kind: transaction
-      id: tx.create_order.new
-      data_model: data.checkout
-      isolation: read_committed
-      idempotency:
-        kind: deduplicated_by
-        key:
-          components:
-            - source: input:input.create_order.request
-              path: idempotency_key
+operations:
+  op.create_order:
+    service: svc.orders
+    description: Create a new order
+    inputs:
+      input.create_order.request:
+        kind: request
+        schema: schema.CreateOrderRequest
+        result:
+          ok: schema.CreateOrderResponse
+          err:
+            schema: schema.RequestRejected
+            disposition: unspecified
+    program:
       steps:
-        - kind: insert
-          object: object.order
-          values:
-            kind: deterministic
-            from:
-              - source: input:input.create_order.request
-                path: order_id
-              - source: input:input.create_order.request
-                path: amount
-        - kind: establish_effect_intent
-          bind: intent.create_order.publish_created
-          effect_id: effect.create_order.publish_created
+        - kind: transaction
+          id: tx.create_order
+          data_model: data.orders
+          isolation: serializable
+          steps:
+            - kind: write_outbox
+              effect_id: effect.create_order.outbox_created
+              effect:
+                outbox: outbox.order_events
+                schema: schema.OrderCreated
+              values:
+                kind: deterministic
+                from:
+                  - source: input:input.create_order.request
+                    path: order_id
+            - kind: establish_transaction_output
+              bind: output.create_order
+              schema: schema.CreateOrderResponse
+              values:
+                kind: deterministic
+                from:
+                  - source: input:input.create_order.request
+                    path: order_id
+        - kind: execute_effect
+          effect_id: effect.create_order.publish_event
           effect:
             kind: publication
             topic: topic.order_events
             schema: schema.OrderCreated
-            idempotency_key_propagation:
-              - source:
-                  components:
-                    - source: input:input.create_order.request
-                      path: idempotency_key
-                target:
-                  components:
-                    - source: effect:effect.create_order.publish_created
-                      path: event_id
-          values:
-            kind: deterministic
-            from:
-              - source: input:input.create_order.request
-                path: order_id
-              - source: input:input.create_order.request
-                path: idempotency_key
-        - kind: establish_transaction_output
-          bind: output.create_order
-          schema: schema.CreateOrderResponse
-          values:
-            kind: deterministic
-            from:
-              - source: input:input.create_order.request
-                path: order_id
-    - kind: execute_effect_intent
-      intent: intent.create_order.publish_created
-    - kind: return
-      request: input.create_order.request
-      outcome:
-        kind: ok
-        values:
-          kind: deterministic
-          from:
-            - source: transaction_output:output.create_order
-              path: order_id
-            - source: transaction_output:output.create_order
-              path: status
-```
-
-Program step kinds:
-
-| Step kind | Purpose |
-|---|---|
-| `transaction` | Declare and execute (or resolve the prior keyed commit of) an inline atomic transaction |
-| `execute_effect` | Declare an inline effect contract and execute it directly, optionally binding its result |
-| `execute_effect_intent` | Execute a previously bound effect intent, optionally binding its result |
-| `match_result` | Branch on a bound effect result (`ok` arm / `err` arm) |
-| `branch` | Branch on a modeled condition |
-| `return` | Terminate with a constructed request result |
-| `complete` | Terminate without a result (natural for subscription-driven operations) |
-
-### Stable execution-site IDs
-
-Some inline occurrences carry a stable semantic ID that identifies the inline declaration itself, not another declaration. These IDs are used for keyed commit identity, diagnostics, conformance, and proof evidence:
-
-- `Transaction.id` on an inline `transaction` step
-- `effect_id` on `execute_effect` and `establish_effect_intent`
-
-Moving an inline transaction inside the program does not silently change its durable commit identity because that identity is anchored on `Transaction.id`, not on the step's position.
-
-### Typed bindings
-
-Execution sites introduce immutable, single-producer, operation-local **bindings** that name what execution produces:
-
-| Binding kind | Producer | Names |
-| --- | --- | --- |
-| Transaction read | `read` step (`bind:`) | A transaction-local observation |
-| Transaction output | `establish_transaction_output` (`bind:`) | A typed value exported from a transaction |
-| Effect intent | `establish_effect_intent` or a transition `effect_intents` entry (`bind:`) | A durable captured effect instance |
-| Effect result | `execute_effect` or `execute_effect_intent` (`bind:`) | An attempt-local synchronous result |
-
-Bindings are visible only after their producer and only within the binding kind's scope. Transaction reads never leave their transaction. Transaction outputs and effect intents may only be consumed at program points where every falling-through path has produced them. Effect result variant payloads (`effect_result_ok`/`effect_result_err`) are local to the matching `match_result` arm.
-
-Requirements live outside the causal execution body, so program-produced bindings are not in scope inside `requirements`.
-
-## Execution concurrency
-
-`execution.concurrency` is an implementation fact about how many invocations of this operation may be simultaneously active across the entire deployment.
-
-```yaml
-execution:
-  concurrency:
-    kind: unbounded
-```
-
-| Value | Meaning |
-|---|---|
-| `bounded(n)` | At most `n` invocations simultaneously active globally |
-| `unbounded` | No finite global concurrency bound is declared |
-| `unspecified` | No global concurrency fact is available |
-
-This is distinct from per-lane concurrency, which applies only to subscription dispatch. A global bound greater than one does not prove same-key serialization.
-
-## Requirements
-
-Every operation may declare correctness obligations under `requirements`. These are proof obligations, the verifier checks whether they hold from the facts declared in the model. See [Requirements](/concepts/requirements) for the four kinds and how verdicts are produced.
-
-```yaml
-requirements:
-  serialization:
-    - key:
-        source: input:input.reserve_inventory.created
-        path: order_id
-  ordering:
-    - key:
-        source: input:input.reserve_inventory.created
-        path: order_id
-  idempotency:
-    - key:
-        components:
-          - source: input:input.reserve_inventory.created
-            path: event_id
-      result: unspecified
-  recoverability:
-    - key:
-        components:
-          - source: input:input.reserve_inventory.created
-            path: event_id
-      completion: guaranteed
-```
-
-## A complete operation example
-
-The following is `operation.create_order` adapted from the flash checkout fixture, a backend operation with a request input, a deduplicated inline transaction, a durable effect intent bound at establishment, and idempotency plus recoverability requirements.
-
-```yaml
-operation.create_order:
-  service: service.checkout
-  description: Create an order and durably arrange publication of OrderCreated.
-  inputs:
-    input.create_order.request:
-      kind: request
-      schema: schema.CreateOrderRequest
-      identity:
-        kind: keyed
-        fields:
-          - idempotency_key
-      result:
-        ok: schema.CreateOrderResponse
-        err: schema.RequestRejected
-  program:
-    steps:
-      - kind: transaction
-        id: tx.create_order.new
-        data_model: data.checkout
-        isolation: read_committed
-        idempotency:
-          kind: deduplicated_by
-          key:
-            components:
-              - source: input:input.create_order.request
-                path: idempotency_key
-        steps:
-          - kind: insert
-            object: object.order
-            values:
-              kind: deterministic
-              from:
-                - source: input:input.create_order.request
-                  path: order_id
-                - source: input:input.create_order.request
-                  path: amount
-          - kind: establish_effect_intent
-            bind: intent.create_order.publish_created
-            effect_id: effect.create_order.publish_created
-            effect:
-              kind: publication
-              topic: topic.order_events
-              schema: schema.OrderCreated
-              idempotency_key_propagation:
-                - source:
-                    components:
-                      - source: input:input.create_order.request
-                        path: idempotency_key
-                  target:
-                    components:
-                      - source: effect:effect.create_order.publish_created
-                        path: event_id
-            values:
-              kind: deterministic
-              from:
-                - source: input:input.create_order.request
-                  path: order_id
-                - source: input:input.create_order.request
-                  path: idempotency_key
-          - kind: establish_transaction_output
-            bind: output.create_order
-            schema: schema.CreateOrderResponse
-            values:
-              kind: deterministic
-              from:
-                - source: input:input.create_order.request
-                  path: order_id
-      - kind: execute_effect_intent
-        intent: intent.create_order.publish_created
-      - kind: return
-        request: input.create_order.request
-        outcome:
-          kind: ok
           values:
             kind: deterministic
             from:
               - source: transaction_output:output.create_order
                 path: order_id
-              - source: transaction_output:output.create_order
-                path: status
-  requirements:
-    serialization: []
-    ordering: []
-    idempotency:
-      - key:
-          components:
-            - source: input:input.create_order.request
-              path: idempotency_key
-        result: replay_consistent
-    recoverability:
-      - key:
-          components:
-            - source: input:input.create_order.request
-              path: idempotency_key
-        completion: resumable
-  execution:
-    concurrency:
-      kind: unbounded
+        - kind: return
+          request: input.create_order.request
+          outcome:
+            kind: ok
+            values:
+              kind: deterministic
+              from:
+                - source: transaction_output:output.create_order
+                  path: order_id
 ```
+
+In this example:
+
+1. The transaction writes an outbox message and establishes a transaction output.
+2. The program publishes to a topic using the transaction output for provenance.
+3. The operation returns an `Ok` result constructed from the transaction output.
+
+If serialization is needed, it comes from L1 routing and pool facts, or from L0 transactions and locks. No operation-level concurrency declaration exists.

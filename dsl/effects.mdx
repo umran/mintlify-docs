@@ -384,13 +384,72 @@ The binding is valid only when the underlying effect contract is result-bearing 
 
 ---
 
+## Outbox write effect
+
+An `OutboxWriteEffect` admits one typed logical message to a data-model outbox. It is the only mechanism that writes to an outbox, and it is legal exclusively inside a `write_outbox` transaction step. The write is atomic with the containing transaction commit: `T commits ⇒ mutations commit AND message admitted; T aborts ⇒ neither`.
+
+```yaml title="write_outbox step inside a transaction"
+transaction:
+  id: tx.place_order
+  data_model: data.orders
+  deduplicated_by:
+    key:
+      - source: { kind: input, id: input.request }
+        path: idempotency_key
+  body:
+    - kind: insert
+      # ... writes the Order object
+    - kind: write_outbox
+      effect_id: eff.emit_order_placed
+      effect:
+        outbox: outbox.order_events
+        schema: schema.OrderPlaced
+        idempotency_key_propagation:
+          strategy: from_input_field
+          input: input.request
+          field: idempotency_key
+      values:
+        - target: order_id
+          source:
+            source: { kind: transaction_output, id: out.order_id }
+            path: value
+        - target: placed_at
+          source:
+            source: { kind: input, id: input.request }
+            path: submitted_at
+```
+
+Fields on the contract:
+
+- `outbox` — the target outbox id declared under `data_models.<id>.outboxes`.
+- `schema` — the admitted message schema. It must be listed in the outbox's `messages`.
+- `idempotency_key_propagation` — same shape as for other effects.
+
+The step carries the `effect_id` and the `values` derivation; there is no separate `execute_effect` for an outbox write. Because the write commits atomically with the transaction, an `OutboxWriteEffect` has **no synchronous result**, no async form, and **cannot be bound**. It is also never a transition side effect (`transition` may only establish request/publication/external intents).
+
+<Warning>
+  An outbox write is rejected by every other execution site: `execute_effect`, `execute_effect_async`, `execute_effect_intent`, `execute_effect_intent_async`, and `establish_effect_intent`. Attempts to run an outbox write outside a `write_outbox` step are validation errors.
+</Warning>
+
+### Producer-suppressed versus consumer-collapsed duplicate discharge
+
+Duplicate discharge for outbox writes has two routes:
+
+1. **Producer-suppressed** — the containing transaction declares `deduplicated_by { key }`, so a repeated commit under the same key is suppressed and no duplicate message is admitted at all.
+2. **Message- or consumer-routed** — every modeled consumer of the outbox collapses duplicate deliveries (via its own idempotency requirement).
+
+Either route discharges the effect leg of the operation's idempotency requirement for that write. Both are computed as part of the greatest-fixpoint idempotency analysis (see [Requirements](/concepts/requirements)).
+
+---
+
 ## Summary of effect kinds
 
 | Kind | Has synchronous result? | Idempotency declared how? |
 |---|---|---|
-| `publication` | No, cannot bind a result | Via topic `message_identity` + consumer requirements |
+| `publication` | No, cannot bind a result | Via topic `message_identity` plus consumer requirements |
 | `request` | Yes, inherits from target input | Via target operation's idempotency requirement |
 | `external` | Optional (`result:` or `null`) | Explicitly: `unspecified`, `not_deduplicated`, or `deduplicated_by` |
+| `outbox_write` | No, atomic with transaction | Producer-suppressed (`DeduplicatedBy`) or consumer-collapsed |
 
 <CardGroup cols={2}>
   <Card title="Program Control" icon="code-branch" href="/dsl/program-control">

@@ -47,7 +47,7 @@ Below the graph, the transitions table lists every declared transition with one 
 
 ### Side effects and executors
 
-A transition's side effects are the publication or request effects it owns. These effects are not executed by the transition itself — they are established as effect intents inside the transaction that applies the transition, then executed by an `execute_effect_intent` step later in the operation's program. The **Executors** column shows which operations apply this transition and therefore carry responsibility for executing its side effects.
+A transition's side effects are the publication, request, or external effects it owns. These effects are **implicitly established as effect-intent artifacts** by the `transition` step that applies the transition; the operation program later executes them with `execute_effect_intent` (or `execute_effect_intent_async`). The transition's `effect_intents` map wires side-effect id to `{ bind, values }` for each intent, and the mapping must be exact. Because a transition-containing transaction is never naturally replayable, its containing transaction must declare `deduplicated_by` for the recovery route to close. The **Executors** column shows which operations apply this transition and therefore carry responsibility for executing its side effects.
 
 Click any operation name in the Executors column to navigate to that operation's [Operation View](/visualization/operation-view).
 

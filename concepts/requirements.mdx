@@ -1,196 +1,124 @@
 ---
-title: "Correctness Requirements in Conseqa: Proof Obligations"
+title: "Conseqa Operation Requirements: Serialization, Ordering, Idempotency, and Recoverability"
 sidebarTitle: "Requirements"
-description: "Requirements are proof obligations declared on operations. Learn serialization, ordering, idempotency, and recoverability, plus how verdicts are produced."
+description: "Operation requirements are proof obligations. Serialization, ordering, idempotency, result replay, and recoverability each have distinct discharge routes and constraints."
 ---
 
-Requirements are the correctness properties you want your architecture to satisfy. You declare them on operations under the `requirements` key. The verifier then attempts to prove each requirement from the facts declared elsewhere in the model — topic ordering, transaction isolation, delivery semantics, dispatch routing, and so on. Declaring a requirement says "this must hold." It does not assert that it does hold. Only a `proven` verdict does that.
-
-<Warning>
-Declaring a requirement is not the same as proving it. Always check the verification output for the verdict (`proven`, `unknown`, or `disproven`) before relying on a correctness property in production.
-</Warning>
-
-## The four requirement kinds
-
-An operation's `requirements` block contains four lists. Each list is empty (`[]`) by default, meaning no obligation is declared for that property.
-
-```yaml
-requirements:
-  serialization: []
-  ordering: []
-  idempotency: []
-  recoverability: []
-```
+Operation requirements are **proof obligations**. Declaring one does not assert that the operation already satisfies it. The verifier must prove it from the declared facts and architecture.
 
 ## Serialization
 
-A serialization requirement declares that same-key invocations must not execute concurrently.
+A serialization requirement keyed by a `ValueRef` means:
 
-```yaml
-serialization:
-  - key:
-      source: input:input.reserve_inventory.created
-      path: order_id
-```
+> Invocations with the same logical key must not execute concurrently.
 
-`key` is a single `ValueRef` — a source and a field path. The requirement constrains only invocations triggered by the input the key is sourced from. Invocations with different key values may run concurrently; invocations with the same key value must not overlap.
+Different keys may execute concurrently unless constrained elsewhere. Serialization establishes mutual exclusion and non-overlap. It does **not** establish which same-key invocation should come first.
 
-Serialization establishes mutual exclusion only. It does not establish which same-key invocation comes first. A non-FIFO lock or single-lane execution with any enqueue order may prove serialization without proving ordering.
+V1 accepts four discharge routes. In every non-vacuous route, the target pool must declare `member_concurrency = bounded(1)` and the routing domain must have a single owning member.
 
-**Proven by:** a mechanism that prevents overlap for equal key values — for example, `by_topic_key` dispatch with `lane_concurrency: bounded(1)`, or an exclusive lock acquired before any conflicting work.
+### Vacuous population
+
+The key's message-driven input admits no message schemas, so the constrained population is empty by declaration. This is the only `l0_only` route.
+
+### Request-routed
+
+A `Router` serves the key's request boundary. Every component of its semantic routing key carries the same logical value as the requirement key. Its `MemberAssignment` gives that domain one active owning member (including through safe ownership transfer), and the target pool declares `member_concurrency = bounded(1)`.
+
+### Subscription-routed
+
+The same argument on the delivery side, with `key: grouping_key` naming the effective grouping domain and the requirement key established to carry the grouping key for every admitted schema.
+
+### Outbox-routed
+
+The same argument over an outbox input's keyed partitioning. The dispatch's `MemberAssignment` gives each partition one active owning member, the pool is serial, **and the dispatch declares no batching stage**. A declared batching stage stops the serialization route outright: batch-internal overlap is intentionally unmodeled.
+
+<Warning>
+  A shared pool is a shared execution population, not a shared routing domain: two boundaries assigned to one pool borrow nothing from each other. Routing absence yields no member-affinity fact. A routing key wider than the requirement key partitions same-key invocations across domains. `bounded(n)` with `n > 1` permits overlap.
+</Warning>
 
 ## Ordering
 
-An ordering requirement declares that same-key invocations must take effect in the semantic precedence order established by their source.
+An ordering requirement keyed by a `ValueRef` means:
 
-```yaml
-ordering:
-  - key:
-      source: input:input.reserve_inventory.created
-      path: order_id
-```
+> Same-key invocations for which a meaningful logical precedence exists must preserve that precedence through the operation's semantically relevant execution.
 
-Ordering is strictly stronger than serialization. A proof must establish both where the relevant precedence comes from and that the execution mechanism preserves it. Arbitrarily serializing concurrent inputs satisfies serialization but cannot invent a required semantic precedence.
+A proof must establish both where the relevant precedence comes from and that the execution mechanism preserves it. Arbitrarily serializing concurrent inputs can satisfy a serialization requirement but cannot invent a semantic precedence required by an ordering proof.
 
-**V1 recognizes one precedence source:** the order declared on the key's subscription topic — a keyed topic's per-key order (when the ordering key carries the topic key for every admitted schema), or a global topic's order for any key.
+### Precedence sources
 
-**The standard execution mechanism:**
+V1 recognizes two precedence sources:
 
-```text
-keyed topic ordering
-       ↓
-by_topic_key dispatch       ← same-key deliveries enter one lane
-       ↓
-lane_concurrency bounded(1) ← invocations in one lane cannot overlap
-```
+1. **Transport ordering** (`within_group` or `global`) for a subscription-triggered key.
+2. **Outbox ordering** (`partition` or `global`) for an outbox-triggered key.
 
-Each declaration contributes a different fact; none substitutes for another.
+A request input has no precedence source at all, so a request-routed boundary proves serialization but not ordering.
+
+### Mechanism
+
+The mechanism is the serialization argument plus a precedence: the requirement key is established to be the effective grouping key for every admitted schema, `key: grouping_key` routes by that same domain, `MemberAssignment` gives it one active owning member, and `member_concurrency = bounded(1)` stops a later invocation from overtaking an earlier one.
+
+Dispatch preserves precedence and never creates it, so dispatch alone can never supply ordering.
+
+### Batching and ordering
+
+A declared batching stage is judged explicitly. `ordering: preserved` lets the established precedence pass through the stage. `ordering: unspecified` stops the proof, because the stage then provides no evidence the order survives execution. Order preservation is an ordering fact only: it is never read as a no-overlap guarantee, which is why serialization refuses batching outright while ordering accepts `preserved`.
 
 ## Idempotency
 
-An idempotency requirement identifies a logical invocation by a composite `IdempotencyKey` and declares that repeated attempts representing the same logical invocation must not cause externally distinguishable duplicate logical work beyond what the declared idempotency contract permits.
+An idempotency requirement identifies a logical invocation by a composite `IdempotencyKey`. It means:
 
-```yaml
-idempotency:
-  - key:
-      components:
-        - source: input:input.create_order.request
-          path: idempotency_key
-    result: replay_consistent
-```
+> Repeated attempts representing the same logical invocation must not cause externally distinguishable duplicate logical work beyond what the declared idempotency contract permits.
 
-### Idempotency key
+V1 discharges the requirement over each admitted path under the governing key's population. Three legs must hold on every admitted path:
 
-`key` is an `IdempotencyKey`: an ordered tuple of `ValueRef` components. Two attempts share the same logical invocation identity when all components evaluate to equal values. The key is a composite — not a set of alternatives.
+### State leg
 
-Every component must be sourced from a single input of the operation (the triggering input). A component sourced from mutable state or from an artifact the invocation itself produces cannot define a pre-execution equivalence class; such a key yields an `unknown` verdict.
+Every transaction step must be retry-safe: a keyed commit over a stable key, or naturally replayable.
 
-### `result: replay_consistent`
+### Effect leg
 
-When `result: replay_consistent` is declared, the verifier additionally checks that repeated admitted attempts in the same idempotency class that return a request result return the same result variant and a replay-equivalent payload. Omit this or use `result: unspecified` when you need only side-effect safety, not a stable return value.
+Every effect-executing step must be duplicate-safe. A request is safe only when its target collapses duplicate invocations. A publication is safe only when every modeled consumer collapses duplicate deliveries. An outbox write is safe when its containing transaction suppresses a second commit, or every modeled consumer collapses duplicate deliveries. An outbox boundary does **not** terminate the causal effect graph: the cascade continues through every outbox input admitting the written schema.
 
-### What the verifier checks
+### Control leg
 
-For each admitted path through the program, the verifier checks three legs:
+Every decision on the path must replay: the matched result replay-stable, or the branch condition deterministic over replay-stable roots, so every attempt in the class traverses the same path.
 
-1. **State leg.** Every transaction on the path must be retry-safe: either naturally replayable or deduplicated by a stable key.
-2. **Effect leg.** Every effect-executing step must be duplicate-safe: a publication is safe when topic identity and all modeled consumers' idempotency collapse duplicates; a request is safe when the target proves its own idempotency; an external effect is safe when `deduplicated_by` with a stable key.
-3. **Control leg.** Every decision on the path must replay: a `branch` condition is deterministic over replay-stable roots; a `match_result` matches a replay-stable result.
+Mutually dependent verdicts are computed as a **greatest fixpoint**: a cycle of requirements that each collapse the others' duplicates is proven and marked coinductive.
 
-The verifier computes verdicts as a greatest fixpoint across mutual dependencies between operations (publications through topics, requests to other operations), so a cycle of requirements that each collapse the others' duplicates can be proven.
+## Result replay
+
+The `result` member of an idempotency requirement asks a further question:
+
+> Repeated admitted attempts in the same logical idempotency class that return a request result must return the same result variant and a replay-equivalent payload.
+
+V1 discharges this, for each admitted path ending at a `return` for the triggering input, when:
+
+1. every decision on the path replays, and
+2. the terminal's derivation is replay-deterministic in the context at the terminal.
+
+Premise 2 may name other operations' verdicts, since a bound request result is stable only when the target proves its result replay-consistent for the targeted input. These checks are also computed as a greatest fixpoint.
 
 ## Recoverability
 
-A recoverability requirement declares that the logical invocation identified by its key must reach a valid terminal (`return` or `complete`) after any modeled interruption.
+A recoverability requirement keyed by an `IdempotencyKey` means:
 
-```yaml
-recoverability:
-  - key:
-      components:
-        - source: input:input.apply_payment.captured
-          path: event_id
-    completion: guaranteed
-```
+> The logical invocation identified by that key must reach a valid terminal of the operation program after any modeled interruption.
 
-Recoverability is a **progress** obligation. Idempotency is a **safety** obligation. Neither implies the other.
+Recoverability is a **progress** obligation. Idempotency is a **safety** obligation. They are deliberately separate because neither implies the other.
 
-- **Idempotency without recoverability** — repeated attempts are safe, but there is no obligation to re-drive the invocation to completion. An interrupted operation that is never retried violates nothing idempotency-wise.
-- **Recoverability without idempotency** — the invocation must eventually reach a terminal, but repeating the work is assumed harmless. Use this when the operations are inherently safe to repeat.
+### `resumable`
 
-### `completion: resumable`
+An interrupted attempt must be **able** to resume and drive the program to a terminal. V1 discharges this by same-path continuation: for every admitted path, re-driving that same path from its first step must reach the path's terminal. A decision is **never** an obstacle to progress.
 
-An interrupted attempt must be **able** to resume and drive the program to a terminal. The verifier checks that every already-committed transaction resolves on re-encounter (by natural replay or by `deduplicated_by` key), and that every artifact a later step consumes is replay-available.
+### `guaranteed`
 
-```yaml
-completion: resumable
-```
+The architecture must guarantee that the logical invocation **is** re-driven until the program reaches a terminal. This additionally requires a modeled retry driver:
 
-`resumable` does not oblige the architecture to actually re-drive the invocation. Use it when the retry driver lies outside the model — typically a request input whose caller Conseqa does not model.
+- `delivery: at_least_once` on the triggering subscription's runtime or on the triggering outbox input's runtime (runtime-dependent proof)
+- an inbound `RequestEffect` whose `retry` is `may_repeat` (L0-only proof)
 
-### `completion: guaranteed`
+A `guaranteed` recoverability proof for an operation that declares no idempotency requirement carries a **warning**, because the driver makes retries expected and nothing declares them safe.
 
-In addition to resumability, the architecture must guarantee that the logical invocation **is** re-driven until the program reaches a terminal. This is a liveness obligation.
-
-```yaml
-completion: guaranteed
-```
-
-A `guaranteed` proof requires a modeled retry driver:
-- `delivery: at_least_once` on the triggering subscription, or
-- an inbound `RequestEffect` whose `retry` is `may_repeat`
-
-<Note>
-`guaranteed` recoverability proofs are conditional on the delivery abstraction genuinely redelivering until the invocation succeeds. `at_least_once` delivery does not encode retry timing, retry count, backoff, or a bounded eventual-delivery liveness guarantee. The proof rests on the modeled fact, subject to implementation conformance.
-</Note>
-
-<Warning>
-If you declare `completion: guaranteed` on an operation that has no idempotency requirement keyed from the triggering input, the verifier emits a warning. The retry driver makes retries expected, and nothing declares them safe.
-</Warning>
-
-## Verdicts
-
-After running `conseqa model.yaml`, every declared requirement receives one of three verdicts:
-
-| Verdict | Meaning |
-|---|---|
-| `proven` | The requirement follows from the declared facts |
-| `unknown` | The verifier could not establish the requirement from the available facts |
-| `disproven` | The verifier found a concrete path that violates the requirement |
-
-`unknown` is **epistemic** — it means the model does not provide enough facts to complete a proof. It does not mean the implementation is actually incorrect. Respond to `unknown` by adding the missing declarations (a keyed transaction deduplication, a declared message identity, a dispatch routing fact) rather than treating the requirement as satisfied.
-
-`disproven` identifies a specific structural gap or contradiction. The obligation summary names the path and the obstacle.
-
-## A complete requirements example
-
-The following is the full requirements block from `operation.apply_payment` in the flash checkout model. It declares serialization and ordering over `order_id` (so same-order payment applications are serialized and ordered), idempotency keyed by `event_id` (so duplicate deliveries of the same `PaymentCaptured` event are safe), and guaranteed recoverability (so the order is never left in `paid` state without the downstream effect having been attempted).
-
-```yaml
-requirements:
-  serialization:
-    - key:
-        source: input:input.apply_payment.captured
-        path: order_id
-  ordering:
-    - key:
-        source: input:input.apply_payment.captured
-        path: order_id
-  idempotency:
-    - key:
-        components:
-          - source: input:input.apply_payment.captured
-            path: event_id
-      result: unspecified
-  recoverability:
-    - key:
-        components:
-          - source: input:input.apply_payment.captured
-            path: event_id
-      completion: guaranteed
-```
-
-## Requirements and the verification cascade
-
-Idempotency verdicts are mutually dependent: a publication effect is safe only when every modeled consumer collapses duplicates, and a request effect is safe only when the target proves its own idempotency. The verifier computes all verdicts together as a greatest fixpoint. A cycle of requirements that each collapse the others' duplicates is marked `proven (coinductive)` — the proof rests on the mutual assumption, which is sound by a minimal-counterexample argument.
-
-The same fixpoint governs `result: replay_consistent` requirements through request chains. A proof of replay consistency in one operation may depend on replay consistency in the operation it calls, and vice versa.
+<Info>
+  For how L1 runtime facts discharge these requirements, see [Routers and pools](/runtime/routers-and-pools) and the runtime pages.
+</Info>

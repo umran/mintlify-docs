@@ -40,7 +40,9 @@ The inputs section lists what triggers an invocation:
 | Source | For requests: the payload schema. For subscriptions: the topic and admitted message schemas |
 | Identity / Delivery / Routing | Fact badges with tooltips explaining each declared semantic |
 
-For a subscription input, delivery semantics (`at_least_once`, `at_most_once`), dispatch routing (`by_topic_key`, `single_lane`, `unconstrained`), and lane concurrency (`bounded(n)`, `unbounded`) each appear as a badge. For a request input, the declared identity kind appears as a badge. Hover any badge to see its tooltip.
+For a subscription input, the effective grouping and ordering (`within_group`, `global`, `none`), the delivery semantics (`at_least_once`, `at_most_once`), and the dispatch pool with its member assignment each appear as a badge. Runtime facts come from `TopicRuntime` or the matching `SubscriptionRuntime` under `Model.runtime`. For an outbox input, badges show the outbox partitioning, ordering, delivery, and dispatch pool from the `OutboxRuntime`. For a request input, the declared identity kind and any `Router` binding appear as badges. Hover any badge to see its tooltip.
+
+Async program steps (`execute_effect_async`, `execute_effect_intent_async`, `join_all`, `race`) and `write_outbox` steps are first-class in the operation view. Each async launch is drawn with its handle name; a `join_all` or `race` node draws inbound edges from every referenced launch. A `write_outbox` step is drawn inside its containing transaction and carries an edge to the target outbox in the [System View](/visualization/system-view). Every obligation card carries a scope badge (`l0_only` or `runtime_dependent`) so you can see at a glance whether removing the runtime block would leave the proof intact.
 
 ## Program flow
 

@@ -1,0 +1,135 @@
+---
+title: "Topic and Subscription Runtime: Transport Semantics in Conseqa"
+sidebarTitle: "Topic & Subscription Runtime"
+description: "Declare transport grouping, ordering, delivery, and dispatch. Understand the exclusive scope rule and the two valid declaration modes in Conseqa L1."
+---
+
+Topic and subscription runtime facts determine how messages are grouped, ordered, delivered, and dispatched into execution pools. These declarations sit under `Model.runtime.topics` and `Model.runtime.subscriptions`. Two scopes exist: transport semantics can be declared once per topic, or independently per subscription, but never both at once for the same topic.
+
+<Info>
+  L0 topics declare only which schemas a channel may carry and how one logical message is identified. All grouping and ordering facts are L1 runtime properties. The same logical channel may be realized differently by different subscribers.
+</Info>
+
+## Exclusive scope rule
+
+For any topic, grouping and ordering are declared at exactly **one** of two scopes:
+
+- **Topic-scoped**: `TopicRuntime` declares one domain for the whole topic. Every subscriber observes those semantics.
+- **Subscription-scoped**: each `SubscriptionRuntime` declares its own semantics independently.
+
+These are different declaration modes, not a default and an override. Validation rejects a model that uses both for one topic.
+
+<Warning>
+  There is no inheritance, no override, and no fallback chain. Omitting `ordering` leaves the scope open; writing `ordering: none` is an explicit negative that claims the scope.
+</Warning>
+
+### Topic-scoped example
+
+```yaml title="Topic-scoped transport semantics"
+runtime:
+  topics:
+    topic.order_events:
+      grouping:
+        schema.OrderCreated:
+          - account_id
+        schema.OrderCancelled:
+          - account_id
+      ordering: within_group
+  subscriptions:
+    op.process_order:
+      input.sub_order_events:
+        delivery: at_least_once
+        dispatch:
+          pool: pool.order_workers
+```
+
+### Subscription-scoped example
+
+```yaml title="Subscription-scoped transport semantics"
+runtime:
+  topics:
+    topic.order_events: {}
+  subscriptions:
+    op.process_order:
+      input.sub_order_events:
+        delivery: at_most_once
+        grouping:
+          schema.OrderCreated:
+            - account_id
+        ordering: within_group
+        dispatch:
+          pool: pool.order_workers
+    op.notify_ops:
+      input.sub_order_events:
+        delivery: at_least_once
+        grouping:
+          schema.OrderCreated:
+            - region_id
+        ordering: within_group
+        dispatch:
+          pool: pool.notification_workers
+```
+
+## TopicRuntime
+
+```yaml
+topic.<topic_id>:
+  grouping?:
+    <schema_id>: [<field paths>]
+  ordering?: omitted | none | global | within_group
+```
+
+- **`grouping`**: maps each schema into a common grouping domain. Tuple positions correspond across schemas, so all mapped tuples share one arity. Every carried schema must be mapped.
+- **`ordering`**:
+  - `global`: one precedence relation across all messages in scope
+  - `within_group`: precedence among messages of the same declared grouping domain (requires `grouping`)
+  - `none`: explicit "this transport orders nothing"
+  - omitted: no precedence is declared at this scope (scope remains open)
+
+## SubscriptionRuntime
+
+```yaml
+runtime.subscriptions[<operation>][<input>]:
+  delivery: unspecified | at_most_once | at_least_once
+  grouping?: ...          # subscription-scoped mode only
+  ordering?: ...
+  dispatch:
+    pool: <execution pool id>
+    routing?:                       # optional
+      key: grouping_key
+      member_assignment: { kind: consistent_hash }
+```
+
+### Delivery semantics
+
+| Value | Meaning |
+| --- | --- |
+| `unspecified` | Duplicate or loss behavior is unknown. |
+| `at_most_once` | The same logical message is delivered no more than once. Loss may still occur. Not exactly once. |
+| `at_least_once` | A successfully published logical message may be delivered more than once. This is a duplicate-delivery fact; it encodes no retry timing, retry count, backoff, or bounded liveness guarantee. |
+
+### SubscriptionDispatch
+
+Dispatch connects transport semantics to execution topology. The referenced `pool` names the execution population that receives deliveries.
+
+- **`routing` is optional**. Absence means deliveries execute within the pool, with no member-affinity fact.
+- **`key: grouping_key`** routes by the effective grouping domain, whichever scope declared it. This requires a keyed grouping to be in effect.
+
+Dispatch preserves existing precedence and never invents it. Where a precedence exists, a conforming runtime must not admit a later message in a manner that lets it overtake an earlier, incomplete message within the same effective group.
+
+<Note>
+  Dispatch preserving order is an obligation of the realization, not a substitute for declaring transport precedence. A dispatch declaration alone proves no ordering.
+</Note>
+
+## Grouping vs ordering
+
+Grouping and ordering are deliberately separate declarations because a transport may provide one without the other:
+
+- An unordered queue with consistent-hash workers provides **grouping without ordering**.
+- A global sequential stream provides **ordering without grouping**.
+
+Serialization proofs need only grouping: same key implies same routing domain, which implies same owning member on a serial pool. Ordering proofs need grouping plus a declared precedence source. See the [Operations requirements page](/concepts/operations) for how these requirements are discharged.
+
+<Tip>
+  For the full semantics of `MemberAssignment` and `ExecutionPool`, see [Routers and Pools](/runtime/routers-and-pools).
+</Tip>

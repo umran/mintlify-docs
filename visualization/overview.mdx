@@ -1,10 +1,10 @@
 ---
 title: "Generate Interactive HTML Visualizations with conseqa-viz"
 sidebarTitle: "Overview"
-description: "Generate a self-contained, interactive HTML visualization of your Conseqa model — with or without proof results — using the conseqa-viz tool."
+description: "Generate a self-contained, interactive HTML visualization of your Conseqa model, with L0 and optional L1 layers, outboxes rendered as first-class edges and nodes, and proof verdicts overlaid."
 ---
 
-`conseqa-viz` turns any Conseqa model into a single interactive HTML file you can open directly from disk, attach to a pull request, or share as a design artifact. The output makes no network requests, has no external dependencies, and works fully offline.
+`conseqa-viz` turns any Conseqa model into a single interactive HTML file you can open directly from disk, attach to a pull request, or share as a design artifact. The output makes no network requests, has no external dependencies, and works fully offline. It renders both layers of the model: **L0**, the abstract application machine, is always drawn; **L1**, the optional runtime realization under `Model.runtime`, can be toggled from the top bar.
 
 ## Generating a visualization
 
@@ -57,7 +57,7 @@ The output goes to stdout unless you supply `--out`.
 
 ## The three views
 
-The HTML contains three interconnected views. Navigate between them using the breadcrumbs in the top bar or by clicking entities in the current view.
+The HTML contains three interconnected views, all rendered as SVG in the browser. Navigate between them using the breadcrumbs in the top bar or by clicking entities in the current view.
 
 <CardGroup cols={2}>
   <Card
@@ -65,21 +65,21 @@ The HTML contains three interconnected views. Navigate between them using the br
     icon="diagram-project"
     href="/visualization/system-view"
   >
-    The full architecture as an SVG graph — services, topics, external systems, and the edges that connect them.
+    The full architecture as an SVG graph: services, operations, topics, outboxes, external systems, and every information route between them. L1 runtime vertices (routers, subscription dispatches, execution pools) appear as intermediate nodes on their corresponding edges when L1 is enabled.
   </Card>
   <Card
     title="Operation View"
     icon="code-branch"
     href="/visualization/operation-view"
   >
-    Program flow, requirements, and inputs for any individual operation. Double-click an operation node to drill in.
+    Program flow, requirements, and inputs for any individual operation, including `write_outbox` steps, async launches (`execute_effect_async`, `execute_effect_intent_async`), and synchronization barriers (`join_all`, `race`). Proof scope badges indicate whether an obligation is `l0_only` or `runtime_dependent`.
   </Card>
   <Card
     title="State Machine View"
     icon="circle-nodes"
     href="/visualization/state-machine-view"
   >
-    Lifecycle diagrams for every declared state machine, with transitions, side effects, and proof overlays.
+    Lifecycle diagrams for every declared state machine, with transitions, side-effect badges, and proof overlays. Transition side effects appear as implicit effect-intent artifacts.
   </Card>
   <Card
     title="Modeling a Checkout Flow"

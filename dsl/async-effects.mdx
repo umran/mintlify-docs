@@ -1,0 +1,161 @@
+---
+title: "Async Effect Execution, Handles, and Synchronization Barriers"
+sidebarTitle: "Async Effects"
+description: "Fire off effects concurrently with execute_effect_async, then wait for them at explicit synchronization barriers using join_all or race. Handles are semantic and never persistable."
+---
+
+Conseqa's default effect execution is synchronous: `execute_effect A; execute_effect B` establishes the causal order `complete(A) < start(B)`. Async execution relaxes that so multiple effects may run concurrently, but Conseqa keeps synchronization explicit through **handles** and **join_all / race barriers**. Async is an execution mode, not a new kind of effect.
+
+<Info>
+  Async execution is available for `publication`, `request`, and `external` effects. It is not available for `outbox_write` (which is atomic with its transaction commit) and not available for `transaction`, `block`, `branch`, or terminal steps.
+</Info>
+
+## Async launch steps
+
+### execute_effect_async
+
+Launches an inline effect concurrently with the surrounding program.
+
+```yaml
+- kind: execute_effect_async
+  handle: handle.charge
+  effect_id: eff.charge_payment
+  effect:
+    kind: request
+    target: { operation: op.payments.charge, input: input.request }
+    retry: never
+    idempotency_key_propagation:
+      strategy: from_input_field
+      input: input.request
+      field: idempotency_key
+  values:
+    - target: amount
+      source: { source: { kind: input, id: input.request }, path: amount }
+```
+
+The launch establishes only `start(A) < start(B)` between async A and any subsequent step B. It **does not** establish `complete(A) < start(B)`. Any result binding — even for a result-bearing effect — is deferred to a synchronization barrier.
+
+### execute_effect_intent_async
+
+Executes a previously established effect intent in async mode.
+
+```yaml
+- kind: execute_effect_intent_async
+  handle: handle.notify
+  intent: intent.send_receipt
+```
+
+Semantics mirror `execute_effect_intent`, with the same handle rules as `execute_effect_async`.
+
+## Handles are semantic, not values
+
+An async **handle** is an operation-local synchronization artifact. It has:
+
+- no schema
+- no field path
+- no `ValueSource` kind
+
+Handles cannot be persisted, cannot be used as an idempotency key, cannot be returned from the operation, and cannot appear inside `values` derivations. They exist only to name a pending completion for a later `join_all` or `race` step.
+
+<Warning>
+  Do not confuse an async handle with an `effect_id`. The `effect_id` is a stable execution-site identity that persists in the model file, appears in reports, and anchors keyed commit and intent identity. A handle is transient runtime plumbing scoped to one program execution.
+</Warning>
+
+## Synchronization barriers
+
+### join_all
+
+Waits for every referenced completion. Each entry may optionally `bind` the result of a result-bearing effect.
+
+```yaml
+- kind: join_all
+  handles:
+    - handle: handle.charge
+      bind: result.charge
+    - handle: handle.notify
+```
+
+Semantics:
+
+- Establishes `complete(H_i) < continuation` for every referenced handle.
+- Establishes **no relative order** among the joined completions.
+- Empty `handles` is invalid.
+- No short-circuit: a failing `Err` on one joined effect does not cancel the others.
+- Result bindings become available to steps after the barrier through `effect_result_ok` / `effect_result_err`.
+
+### race
+
+Waits for the first completion among two or more handles.
+
+```yaml
+- kind: race
+  handles:
+    - handle.primary
+    - handle.fallback
+  bind: result.first
+```
+
+Semantics:
+
+- At least two handles required.
+- If `bind` is present, every candidate must be result-bearing and expose the **same** logical result contract (same `ok` schema and same `err` contract including disposition).
+- No cancellation of losing candidates; they continue to completion as separate work.
+- The winning completion is **not replay-stable**: which candidate wins may differ across attempts. A race-bound result is treated as an obstacle in idempotency and result-replay proofs (see [Requirements](/concepts/requirements)).
+
+## Terminal does not join
+
+An operation reaching `return` or `complete` does **not** implicitly join outstanding handles. Fire-and-forget async is a legal, deliberate modeling pattern:
+
+```yaml
+- kind: execute_effect_async
+  handle: handle.metric
+  # ...
+- kind: complete
+# handle.metric may still be running; that is intentional.
+```
+
+If you need the effect to have completed before the operation terminates, add an explicit `join_all` before the terminal.
+
+## Program reachability
+
+Reachability in the program still walks synchronous control. An unreachable synchronous step is unreachable even if an async handle from an earlier step is still pending:
+
+```yaml
+- kind: execute_effect_async
+  handle: handle.x
+  # ...
+- kind: complete
+- kind: execute_effect     # UNREACHABLE — validation error
+```
+
+## Validation rules
+
+The additional validation rules that apply to async programs:
+
+- Every referenced handle in a `join_all` or `race` must be established by a preceding async launch on every path reaching the barrier.
+- A handle may be joined or raced at most once on any given path.
+- A `bind` on `join_all` or `race` requires the underlying effect (or every candidate, for `race`) to be result-bearing.
+- Async launches never bind results directly.
+- Race binding produces a non-replay-stable value; downstream decisions that depend on it fail the control-leg check unless separately stabilized.
+
+## When to use async
+
+Async execution is a modeling tool, not an optimization. Reach for it when the architecture genuinely runs work in parallel, when a race between primary and fallback is the semantic story, or when the operation needs to fire off best-effort side effects that must not block the terminal. Otherwise, synchronous `execute_effect` is simpler to reason about and yields stronger replay-stability facts by default.
+
+<CardGroup cols={2}>
+  <Card title="Program Control" icon="code-branch" href="/dsl/program-control">
+    Synchronous step kinds, terminals, and decision steps.
+  </Card>
+
+  <Card title="Effects" icon="bolt" href="/dsl/effects">
+    Publication, request, external, and outbox write effect contracts.
+  </Card>
+
+  <Card title="Requirements" icon="scale-balanced" href="/concepts/requirements">
+    How replay-stability affects idempotency and result replay verdicts.
+  </Card>
+
+  <Card title="Value References" icon="link" href="/dsl/value-references">
+    ValueRef kinds, including effect_result_ok and effect_result_err.
+  </Card>
+</CardGroup>

@@ -25,10 +25,10 @@ Verify your model and write the obligation report to a file:
 conseqa model.yaml --report report.json
 ```
 
-The tool prints an obligation summary to stdout and exits with a non-zero code only when the model fails to parse or fails validation (malformed YAML, invalid references). A model that validates and verifies — regardless of how many obligations are `proven`, `unknown`, or `disproven` — exits zero. Use the report JSON to inspect verdicts and enforce your own pass/fail policy.
+The tool prints an obligation summary to stdout and exits with a non-zero code only when the model fails to parse or fails validation (malformed YAML, invalid references). A model that validates and verifies, regardless of how many obligations are `proven`, `unknown`, or `disproven`, exits zero. Use the report JSON to inspect verdicts and enforce your own pass/fail policy.
 
 <Note>
-`unknown` obligations are epistemic: the checker could not establish the property from the declared facts. They are never evidence of a violation. `disproven` obligations mean the checker found a counterexample — inspect these with `conseqa-viz --report report.json` to understand the evidence.
+`unknown` obligations are epistemic: the checker could not establish the property from the declared facts. They are never evidence of a violation. `disproven` obligations mean the checker found a counterexample: inspect these with `conseqa-viz --report report.json` to understand the evidence.
 </Note>
 
 ## Generate the visualization artifact
@@ -74,7 +74,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock')}}
 
       - name: Build Conseqa
         run: cargo build --release
@@ -111,7 +111,7 @@ The `if: always()` guards on the visualization and upload steps ensure that arti
 
 Store `model.yaml` in the same repository as your service code, not in a separate architecture repository. This keeps the model in sync with the implementation it describes and makes diff review natural:
 
-```
+```text
 my-service/
   src/
   model.yaml        ← lives here
@@ -123,14 +123,14 @@ When a code change requires a model update, the model diff and the implementatio
 
 ## Failing on disproven obligations
 
-`conseqa` exits zero after verification regardless of verdict counts — the exit code only signals whether the model is structurally valid. To fail the build on unwanted obligation statuses, add an explicit check using the report JSON:
+`conseqa` exits zero after verification regardless of verdict counts: the exit code only signals whether the model is structurally valid. To fail the build on unwanted obligation statuses, add an explicit check using the report JSON:
 
 ```bash
 # Fail if any obligation is disproven
 jq -e '[.obligations[] | select(.status == "disproven")] | length == 0' report.json
 ```
 
-To require that every obligation is `proven` — rejecting both `unknown` and `disproven`:
+To require that every obligation is `proven`, rejecting both `unknown` and `disproven`:
 
 ```bash
 # Fail if any obligation is not 'proven'
@@ -142,7 +142,32 @@ Adjust the filter to match your team's policy. A newly added requirement starts 
 ## Tracking obligation status over time
 
 <Tip>
-Commit `report.json` to your repository as a baseline. When the verifier's output changes — a previously `unknown` obligation becomes `proven`, or a new requirement is added — the diff in `report.json` makes the change visible in code review. Reviewers can confirm that new obligations are intentional and that any regression from `proven` to `unknown` is understood.
+Commit `report.json` to your repository as a baseline. When the verifier's output changes (a previously `unknown` obligation becomes `proven`, or a new requirement is added), the diff in `report.json` makes the change visible in code review. Reviewers can confirm that new obligations are intentional and that any regression from `proven` to `unknown` is understood.
 </Tip>
 
 A committed report also means the visualization step in CI never needs to re-run verification: it loads the committed report directly, which keeps the viz step fast regardless of model complexity.
+
+## Obligation scope in the report
+
+Each obligation in the report now carries a `scope` field:
+
+- `l0_only`: the proof required no runtime facts.
+- `runtime_dependent`: the proof consumed at least one L1 fact (delivery semantics, routing, pool concurrency, outbox runtime, and so on).
+
+This is useful for CI matrices that verify both a minimal L0-only model and a full model with runtime topology. Removing the `runtime` block from a valid model leaves it valid: runtime-dependent proofs simply become `unproven`, never structural errors. A CI job that strips the runtime block and re-runs the verifier can confirm that the L0 layer stands on its own, while the full-runtime variant checks the complete architecture.
+
+```yaml
+jobs:
+  verify-l0:
+    steps:
+      - uses: actions/checkout@v4
+      - run: yq 'del(.runtime)' model.yaml > model.l0.yaml
+      - run: conseqa model.l0.yaml --report report.l0.json
+      - run: jq -e '[.obligations[] | select(.scope == "l0_only" and .status != "proven")] | length == 0' report.l0.json
+
+  verify-full:
+    steps:
+      - uses: actions/checkout@v4
+      - run: conseqa model.yaml --report report.full.json
+      - run: jq -e '[.obligations[] | select(.status != "proven")] | length == 0' report.full.json
+```

@@ -1,25 +1,23 @@
 ---
 title: "Proving Idempotency Requirements in Conseqa Models"
 sidebarTitle: "Proving Idempotency"
-description: "Learn how to declare and prove idempotency requirements in Conseqa, using the fully-proven video streaming pipeline as a working example."
+description: "Learn how Conseqa's verifier uses three-leg proofs and greatest-fixpoint coinductive reasoning to establish idempotency across requests, publications, and outbox writes."
 ---
 
-Idempotency in Conseqa means that repeated attempts representing the same logical invocation produce the effects of exactly one invocation. The verifier does not settle for declaring a field named `idempotency_key` or checking that a table has a unique index — it traces every effect the operation causes, including cascades into downstream operations and consumers, and establishes that none of them perform distinguishable duplicate work.
+Conseqa treats idempotency as a transitive, coinductive property over the entire causal effect graph of an operation. The verifier does not settle for declaring a key or checking a unique index. It traces every effect an operation causes, including cascades into downstream operations through topics, requests, and outbox writes, and establishes that none of them perform externally distinguishable duplicate work.
 
-This guide walks through the `video_streaming.yaml` fixture, where every obligation proves. It shows each ingredient that enables a proof and explains what happens when one is missing.
+## The three-leg proof
 
-## What the verifier checks
-
-For each declared idempotency requirement, the verifier analyzes every admitted path through the program and applies three checks:
+For each declared idempotency requirement, the verifier analyzes every admitted path through the program and checks three independent legs. All three must hold on every admitted path.
 
 **State leg.** Every transaction on the path must be retry-safe. A transaction is retry-safe in one of two ways:
 
-1. **Natural replayability** — the verifier can establish from the transaction's declared isolation, mutation semantics, and provenance that a second execution produces the same logical outcome.
-2. **Keyed commit deduplication** — the transaction declares `deduplicated_by` with a stable key. On re-encounter, the prior commit resolves and its artifacts are restored without re-executing the body.
+1. **Keyed commit deduplication** — the transaction declares `deduplicated_by` with a stable key. On re-encounter, the prior commit resolves and its artifacts are restored without re-executing the body.
+2. **Natural replayability** — the verifier can establish from the transaction's declared isolation, mutation semantics, and deterministic provenance that a second execution produces the same logical outcome.
 
-**Effect leg.** Every effect-executing step must be duplicate-safe. Publications, requests, and external effects each have their own discharge conditions. Critically, the check is transitive: a publication is only safe if every modeled consumer collapses duplicate deliveries, which means that consumer's idempotency must also be proven.
+**Effect leg.** Every effect-executing step must be duplicate-safe. Publications, requests, external effects, and outbox writes each have their own discharge conditions. Critically, the check is transitive: a publication is only safe if every modeled consumer collapses duplicate deliveries, which means that consumer's idempotency must also be proven. An outbox boundary does not terminate the causal graph: the cascade continues through every outbox input admitting the written schema.
 
-**Control leg.** Every decision on the path must replay. A `match_result` replays if the matched result is stable across attempts. A `branch` replays if its condition is deterministic over stable roots. An unstable decision means a retry may take a different arm and do different work.
+**Control leg.** Every decision on the path must replay. A `match_result` replays if the matched result is replay-stable across attempts. A `branch` replays if its condition is deterministic over stable roots. An unstable decision means a retry may take a different arm and do different work.
 
 ## Declaring an idempotency requirement
 
@@ -35,170 +33,64 @@ requirements:
       result: replay_consistent
 ```
 
-The `key` identifies the logical invocation class. All key components must come from a single input of the operation — the triggering input. The verifier uses this key to determine which two attempts it is reasoning about as "the same logical invocation."
+The `key` identifies the logical invocation class. All key components must come from a single input of the operation: the triggering input. The verifier uses this key to determine which two attempts it reasons about as "the same logical invocation."
 
 `result: replay_consistent` adds a further obligation: not only must repeated attempts avoid duplicate work, they must return the same result variant and a replay-equivalent payload. Omit it if you only care about effect safety and not result stability.
 
-## The video streaming example
+## Greatest-fixpoint coinductive reasoning
 
-The `video_streaming.yaml` fixture models a pipeline where clients upload videos, a transcoder renders them, a catalog publishes them, and a notifier informs the owner. Every obligation proves. Here is what makes each operation's idempotency provable.
+Request and consumer discharge make idempotency verdicts mutually dependent, and cycles are legal models. V1 computes each family's verdicts as a **greatest fixpoint**: every requirement with an admissible governing key is assumed, and whatever fails under that assumption is dropped until nothing more fails. The iteration is monotone, and a cycle whose members each pass their local checks under the mutual assumption is proven and marked _coinductive_.
 
-### `complete_upload` — keyed commit plus intent recovery
+The soundness argument is by minimal counterexample. Suppose some member of a self-consistent set were violated: some execution in which duplicate attempts at one of its logical invocations cause distinguishable duplicate work. Among all such violations across the set, take one whose duplicate work lies at the shortest causal distance from the duplicated attempts. That work is not on the invocation's own path, because the state leg, the external leg, and the publication leg are discharged by local facts that assume nothing about the set. So it lies downstream of a request, publication, or outbox write, and the local check establishes that the duplicates reached the target or consumer as payload-equal inputs, falling into one class of that downstream requirement. The duplicate work is then caused by duplicate attempts of that downstream invocation, at a strictly shorter causal distance, contradicting the choice of violation.
 
-```yaml
-program:
-  steps:
-    - kind: transaction
-      id: tx.complete_upload.register
-      data_model: data.videos
-      isolation: read_committed
-      idempotency:
-        kind: deduplicated_by
-        key:
-          components:
-            - source: input:input.complete_upload.request
-              path: upload_id
-      steps:
-        - kind: insert
-          object: object.video
-          values:
-            kind: deterministic
-            from:
-              - source: input:input.complete_upload.request
-                path: video_id
-              - source: input:input.complete_upload.request
-                path: owner_id
-              - source: input:input.complete_upload.request
-                path: source_uri
-        - kind: establish_effect_intent
-          bind: intent.complete_upload.publish_uploaded
-          effect_id: effect.complete_upload.publish_uploaded
-          effect:
-            kind: publication
-            topic: topic.video_events
-            schema: schema.VideoUploaded
-            idempotency_key_propagation:
-              - source:
-                  components:
-                    - source: input:input.complete_upload.request
-                      path: upload_id
-                target:
-                  components:
-                    - source: effect:effect.complete_upload.publish_uploaded
-                      path: event_id
-          values:
-            kind: deterministic
-            from:
-              - source: input:input.complete_upload.request
-                path: upload_id
-              - source: input:input.complete_upload.request
-                path: video_id
-```
+## Producer-suppressed vs consumer-collapsed outbox discharge
 
-The inline transaction is `deduplicated_by` the request's `upload_id`, which is also the idempotency key. The `establish_effect_intent` step declares the publication contract inline, captures its concrete payload from `values`, and binds the intent, all atomically with the commit. This means:
+An outbox write introduces two distinct discharge routes.
 
-- A second attempt under the same `upload_id` resolves the prior commit and restores the `intent.complete_upload.publish_uploaded` binding without re-inserting the video record.
-- The intent instance is recovered from the keyed commit, so even if the process crashes between the commit and the `execute_effect_intent` step, a retry delivers the same logical `VideoUploaded` message.
+**Producer-suppressed.** The containing transaction's keyed commit deduplication, over a key stable for the governing attempt class, admits at most one logical commit per class. Hence at most one committed occurrence of the write exists. No class-fixity of the message instance is needed: the single commit admits whatever it admitted, once. This route reuses the existing transaction idempotency rules and is independent of what consumers do.
 
-The request also declares a keyed identity on `upload_id`:
+**Consumer-collapsed.** Where repeated executions may commit repeated writes, the publication pattern applies: the destination outbox declares a keyed message identity covering the written schema, the instance is class-fixed (repeated writes denote the same logical message), and every modeled consumer of that message collapses duplicate deliveries through an idempotency requirement keyed from its outbox input that is itself proven, or through `at_most_once` outbox delivery.
 
-```yaml
-input.complete_upload.request:
-  kind: request
-  schema: schema.UploadCompleteRequest
-  identity:
-    kind: keyed
-    fields:
-      - upload_id
-```
+The two routes remain distinct in the proof and carry different evidence. A model may discharge one route, both, or neither.
 
-This declares that any two requests with the same `upload_id` present equal payloads — which makes every field of the request payload replay-stable under the governing key. The verifier relies on this when reasoning about the transaction output and return value.
+## What `acknowledge_on_success` does not do
 
-### `transcode_video` — external deduplication fixes the control decision
+A subscription or outbox input may declare `acknowledge_on_success: true`. This states that when an invocation reaches successful logical completion, the triggering source item is acknowledged for this consumer. It does **not** close an idempotency proof, and it does **not** prove duplicate collapse. Under `at_least_once` delivery, failure or uncertainty before acknowledgement may admit another attempt, so the consumer's own idempotency requirement is what the discharge cites. Acknowledgement defines the consumption-completion boundary, not a duplicate-delivery guarantee.
 
-`transcode_video` is the most interesting case. It calls an external transcoding engine and branches on the result. The engine's contract is declared inline at the `execute_effect` site:
+## Concrete example: publish plus downstream consumer
 
-```yaml
-- kind: execute_effect
-  effect_id: effect.transcode_video.engine
-  effect:
-    kind: external
-    name: transcoding-engine.render
-    idempotency:
-      kind: deduplicated_by
-      key:
-        components:
-          - source: input:input.transcode_video.uploaded
-            path: video_id
-    result:
-      ok: schema.RenderCompleted
-      err:
-        schema: schema.RenderFailed
-        disposition: terminal
-  values:
-    kind: deterministic
-    from:
-      - source: input:input.transcode_video.uploaded
-        path: video_id
-      - source: input:input.transcode_video.uploaded
-        path: source_uri
-  bind: result.transcode_video.render
-```
+Consider a minimal pipeline with a producer operation and a consumer operation connected by a topic.
 
-Two declarations work together here:
+**Producer** (`op.publish_event`):
 
-**`deduplicated_by` with a stable key.** The key is `video_id` from the subscription input, which is replay-stable because the topic declares a keyed message identity on `event_id` and the governing key is `event_id`. Stable key components are not the full picture — the identity pinning rules in the semantics make the full input payload stable, from which `video_id` is deterministically available.
+- Request input with keyed identity on `request_id`.
+- Transaction `deduplicated_by` on `request_id`.
+- `write_outbox` staging `Event` with `idempotency_key_propagation` from `request_id` to `event_id`.
+- Idempotency requirement keyed on `request_id`.
 
-**`disposition: terminal` on the `err` variant.** The `match_result` on the render result at step 3 branches on a bound external result. For this decision to replay — for every attempt to take the same arm — the result must be replay-stable. A `deduplicated_by` external effect fixes the terminal result once it is reached: after the first terminal `Ok` or terminal `Err`, every same-key execution observes the same variant and a replay-equivalent payload. But a retryable `Err` is not a terminal result — it is a per-attempt outcome that says another try is admitted — and an `Err` with unspecified disposition provides no terminality fact.
+**Consumer** (`op.handle_event`):
 
-By declaring `disposition: terminal`, the model states that an `Err` from the transcoding engine conclusively resolves that video's render. The verifier can then establish that the `match_result` on the result replays: a retry observes the same terminal variant, takes the same arm, and does the same subsequent work.
+- `OutboxInput` consuming the outbox, keyed message identity on `event_id`.
+- Transaction `deduplicated_by` on `event_id`.
+- Idempotency requirement keyed on `event_id`.
 
-<Warning>
-If you change `disposition: terminal` to `disposition: retryable` or `disposition: unspecified`, the `match_result` at step 3 is no longer established to replay, and `transcode_video`'s idempotency becomes `unknown`. The cascade then propagates to `complete_upload` through the `VideoUploaded` → `transcode_video` subscription.
-</Warning>
+The verifier proceeds as follows:
 
-### `publish_video` and `notify_published` — keyed commits throughout
+1. Assume `op.publish_event` idempotency holds. On the producer's path, the transaction suppresses duplicate commits via `deduplicated_by`. The outbox write is therefore producer-suppressed. No duplicate logical work is possible at the source. The cascade continues through the outbox because an outbox boundary does not terminate the graph.
+2. The outbox declares keyed message identity on `event_id`, and the producer's propagation maps `request_id` to `event_id`, so payload-equal producer duplicates yield payload-equal outbox messages. Those fall into one class of the consumer's `event_id` key.
+3. Assume `op.handle_event` idempotency holds. Its transaction suppresses duplicate commits by `event_id`, so duplicates at the consumer collapse. The consumer therefore performs no distinguishable duplicate work for payload-equal inputs.
+4. Both assumptions hold together under the greatest-fixpoint iteration. The proof is marked coinductive because the producer and consumer each close the other: the producer's suppressed commit means no new work reaches the consumer, and the consumer's collapsed duplicates mean any work that does reach it is idempotent.
 
-Both downstream operations follow the same pattern as `complete_upload`: their transactions declare `deduplicated_by` a stable `event_id` key from the subscription input, and their effects are either publications with message identity (safe via the topic's dedup guarantee on the consumer side) or external effects with `deduplicated_by`:
+If you remove `deduplicated_by` from the consumer's transaction, the fixpoint drops it: the consumer cannot collapse duplicates, so the producer's cascade is no longer closed, and both obligations become `unknown`.
 
-```yaml
-# notify_published — external push gateway deduplicates by event_id
-- kind: execute_effect
-  effect_id: effect.notify_published.push
-  effect:
-    kind: external
-    name: push-gateway.notify
-    idempotency:
-      kind: deduplicated_by
-      key:
-        components:
-          - source: input:input.notify_published.published
-            path: event_id
-    result: null
-  values:
-    kind: deterministic
-    from:
-      - source: input:input.notify_published.published
-        path: event_id
-```
+## Proof scope: `l0_only` vs `runtime_dependent`
 
-The push gateway declares `deduplicated_by` the subscription's `event_id`. Because `event_id` is the message identity field on `topic.video_events`, and the governing key is the subscription's `event_id`, the key component is replay-stable. The external boundary collapses duplicate executions under the same key.
+Every proof records the semantic layers its argument consumed:
 
-## Idempotency key components must be replay-stable
+- **`l0_only`** — no explicit L1 fact was required. Proofs resting on transaction structure, keyed commits, deterministic provenance, and declared identities stay in this scope.
+- **`runtime_dependent`** — at least one L1 fact was necessary. Proofs that consume delivery semantics (`at_least_once`), routing, `member_concurrency`, or outbox runtime facts fall here.
 
-The verifier refuses to treat any component of an idempotency key as stable unless it can be derived from the rules. The key components must come from the triggering input, and the triggering input's fields are only stable if the input declares a keyed identity that pins them, or the topic declares a keyed message identity covering all admitted schemas.
-
-A common failure mode is using a `transaction_read` result as a key component:
-
-```yaml
-# This will not prove — transaction_read results are never replay-stable
-key:
-  components:
-    - source: transaction_read:read.some_tx.row
-      path: some_id
-```
-
-Transaction-read bindings are local to the transaction execution that produced them and are always treated as unknown for replay purposes.
+For example, a proof that a transaction's `deduplicated_by` suppresses an outbox duplicate is `l0_only`: it uses only the transaction declaration and the request identity, both L0 facts. A proof that `at_least_once` outbox delivery guarantees recoverability is `runtime_dependent`: it consumes an L1 delivery fact.
 
 ## Going from `unknown` to `proven`
 
@@ -214,14 +106,24 @@ When an obligation is `unknown`, the checker's evidence tells you exactly what i
   </Accordion>
 
   <Accordion title="Control decision not established to replay">
-    A `match_result` branches on an unstable result. For an external effect, ensure the boundary declares `deduplicated_by` and the error disposition is `terminal`. For a request effect, ensure the target operation proves `result: replay_consistent` for the targeted input.
+    A `match_result` branches on an unstable result. For an external effect, ensure the boundary declares `deduplicated_by` and the error disposition is `terminal`. For a request effect, ensure the target operation proves `result: replay_consistent` for the targeted input. A result bound by `race` is conservatively treated as unstable by V1.
   </Accordion>
 
   <Accordion title="Downstream consumer idempotency unproven">
-    A publication effect's safety is conditional on every modeled consumer collapsing duplicates. If a consumer's idempotency is `unknown`, the upstream obligation inherits the gap. Fix the consumer's obstacles first; the upstream proof follows automatically through the verifier's greatest-fixpoint computation.
+    A publication or outbox write's safety is conditional on every modeled consumer collapsing duplicates. If a consumer's idempotency is `unknown`, the upstream obligation inherits the gap. Fix the consumer's obstacles first; the upstream proof follows automatically through the verifier's greatest-fixpoint computation.
   </Accordion>
 
-  <Accordion title="Message identity not declared on topic">
-    Without a keyed `message_identity` on the topic, two messages with equal `event_id` are not declared to be the same logical message. Declare `message_identity` on the topic with a mapping for each admitted schema. Without it, duplicate deliveries may have different payloads from the verifier's perspective and cannot be proven safe.
+  <Accordion title="Message identity not declared">
+    Without a keyed `message_identity` on the topic or outbox, two messages with equal identity fields are not declared to be the same logical message. Declare `message_identity` with a mapping for each admitted schema. Without it, duplicate deliveries may have different payloads from the verifier's perspective and cannot be proven safe.
   </Accordion>
 </AccordionGroup>
+
+<CardGroup cols={2}>
+  <Card title="Checkout Flow Guide" icon="shopping-cart" href="/guides/modeling-a-checkout-flow">
+    Build a full flash-sale checkout with outbox and async payment.
+  </Card>
+
+  <Card title="CI Integration" icon="git-merge" href="/guides/ci-integration">
+    Automate verification in your CI pipeline.
+  </Card>
+</CardGroup>

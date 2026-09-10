@@ -1,7 +1,7 @@
 ---
-title: "Obligation Report Format: Structure and Fields Reference"
+title: "Obligation Report Format: JSON Structure and Fields"
 sidebarTitle: "Obligations Report"
-description: "Conseqa writes a JSON report of every verification obligation — status, assumptions, and evidence — consumable by conseqa-viz and any tooling you build."
+description: "Conseqa writes a JSON obligation report with every requirement's verdict, scope (l0_only or runtime_dependent), evidence, and assumptions. The exact shape is what conseqa --report emits."
 ---
 
 When you run `conseqa` with `--report`, the verifier writes a structured JSON file containing every obligation it evaluated: its status, the declared facts the proof depends on, and the checker's evidence for gaps. This report is the machine-readable interface between Conseqa and visualization, CI, and any custom tooling you build.
@@ -10,13 +10,15 @@ When you run `conseqa` with `--report`, the verifier writes a structured JSON fi
 conseqa model.yaml --report output.json
 ```
 
+The exact keys and structure match what the current engine emits. The description below reflects the report format as read by `conseqa-viz` (format 4), which adds proof `scope` and `remedy` fields to earlier shapes. If you are consuming this output programmatically, pin against the `format` field at the top level.
+
 ## Report Structure
 
-The top-level report object has format version `2`, the model revision the report was produced against, the list of obligations, and any model-wide notes.
+The top-level report object contains the format version, the model revision the report was produced against, the list of obligations, and any model-wide notes.
 
 ```json
 {
-  "format": 2,
+  "format": 4,
   "model_revision": 1,
   "obligations": [...]
 }
@@ -25,8 +27,7 @@ The top-level report object has format version `2`, the model revision the repor
 When the verifier raises model-wide notes, a `"notes"` array also appears at the top level. It is omitted entirely when there are none.
 
 <ParamField path="format" type="integer" required>
-  Always `2` for reports produced by the current engine. `conseqa-viz` warns if
-  a report's format version does not match what it expects.
+  The report format version. `conseqa-viz` expects format 4 for reports produced by the current engine and warns when versions do not match.
 </ParamField>
 
 <ParamField path="model_revision" type="integer">
@@ -72,10 +73,16 @@ Each obligation in the `obligations` array describes one declared requirement an
   [Verdicts](/verification/verdicts) for the precise meaning of each.
 </ParamField>
 
+<ParamField path="scope" type="string">
+  Present for `proven` obligations. `l0_only` if no L1 fact was required; `runtime_dependent` if at least one L1 fact was necessary. A `runtime_dependent` proof holds of the declared runtime realization and must be re-examined when that realization changes.
+</ParamField>
+
+<ParamField path="remedy" type="string">
+  Present for unproven (`unknown`) serialization and ordering obligations. `application` if the missing facts belong to L0; `runtime` if they belong to L1. This is a routing hint, not a promise that declaring one fact closes the argument.
+</ParamField>
+
 <ParamField path="summary" type="string" required>
   A human-readable one-sentence description of what the obligation claims.
-  Example: `"Repeated attempts at operation.apply_payment sharing the declared
-  key produce the effects of a single invocation."`
 </ParamField>
 
 <ParamField path="assumptions" type="string[]" required>
@@ -101,7 +108,7 @@ The following excerpt is from the `flash_checkout` example model's report, produ
 
 ```json
 {
-  "format": 2,
+  "format": 4,
   "model_revision": 1,
   "obligations": [
     {
@@ -113,6 +120,7 @@ The following excerpt is from the `flash_checkout` example model's report, produ
         "requirement": 0
       },
       "status": "proven",
+      "scope": "runtime_dependent",
       "summary": "Repeated attempts at operation.apply_payment sharing the declared key produce the effects of a single invocation.",
       "assumptions": [
         "tx.apply_payment commits are deduplicated by input.apply_payment.captured.event_id, stable across the attempt class",
@@ -150,12 +158,10 @@ The following excerpt is from the `flash_checkout` example model's report, produ
 ```
 
 <Note>
-  The `assumptions` list for a proven obligation names every declared fact the
-  proof depends on. Review these after any implementation change to confirm the
-  real system still provides those semantics.
+  The `assumptions` list for a proven obligation names every declared fact the proof depends on. Review these after any implementation change to confirm the real system still provides those semantics, and check the `scope` field to know whether the proof depends on runtime topology.
 </Note>
 
-## Using the Report with conseqa-viz
+## Using the report with conseqa-viz
 
 Pass the report to `conseqa-viz` with `--report` to overlay proof verdicts on the architecture visualization:
 
@@ -169,7 +175,7 @@ Or run the model checker and overlay the results in one step:
 conseqa-viz model.yaml --verify
 ```
 
-When a report is loaded, `conseqa-viz` colors operations, topics, and state machines by their worst obligation status, adds verdict chips to requirement rows in the operation view, and populates the obligations panel with expandable cards showing assumptions, evidence, and counterexample traces.
+When a report is loaded, `conseqa-viz` colors operations, topics, and state machines by their worst obligation status, adds verdict chips to requirement rows in the operation view, and populates the obligations panel with expandable cards showing assumptions, evidence, and counterexample traces. The obligations panel includes a layer filter (`any / L0 / L1`) that uses `scope` for proven obligations and `remedy` for unproven ones.
 
 ## Scaffolding a Report with `--example-report`
 
@@ -188,7 +194,7 @@ The scaffold follows the same format as a real report. Every `assumptions` and `
 <Accordion title="Complete obligation ID structure">
   Obligation IDs follow the pattern:
 
-  ```
+  ```text
   oblig.<subject-kind>.<subject-id>.<property>.<index>
   ```
 

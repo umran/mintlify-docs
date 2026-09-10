@@ -1,184 +1,79 @@
 ---
-title: "Anatomy of a Conseqa Model: Structure and Sections"
+title: "Conseqa Model Overview: Application Layer and Runtime Topology"
 sidebarTitle: "Model Overview"
-description: "A Conseqa model is a YAML file with seven required top-level keys that together describe one snapshot of your distributed architecture."
+description: "Conseqa's DSL has hierarchical semantics: an application layer (L0) describes the logical architecture, and an optional runtime topology layer (L1) describes how it is realized."
 ---
 
-A Conseqa model is a YAML file that describes a snapshot of your distributed architecture. You write it once, run `conseqa model.yaml`, and the verification engine statically checks whether the correctness properties you declared actually follow from the architecture you described. The model is not executable code, a deployment manifest, or a configuration file — it is a logical description from which the verifier reasons.
+Conseqa describes a logical architecture: an abstract application machine and an optional runtime realization layered on top of it. A model is not deployment configuration and not executable code. It is a declaration that a verifier can analyze for structural coherence and correctness.
 
-Every model has the same seven required top-level keys. Each plays a distinct role, and none of them imply runtime behavior on their own.
+## Hierarchical semantics: application, then topology
 
-## Top-level sections
+The DSL is layered. Every declaration belongs to exactly one of two layers, and each layer is meaningful on its own:
 
-### `revision`
+| Layer | What it describes | Where it lives |
+| --- | --- | --- |
+| **L0** | The abstract application machine: services, schemas, data models, topics, state machines, operations, programs, transactions, effects, and requirements. | The model root |
+| **L1** | How that machine is realized in one runtime: transport grouping and ordering, subscription delivery, request routing, execution pools, and storage partitioning. | `Model.runtime` |
 
-`revision` is an opaque numeric marker you increment when the model changes. Conseqa assigns no compatibility, ordering, or migration semantics to it — it is purely a tracking identifier.
+The governing rule is: **L0 says what application machine exists and what properties it requires. L1 says how invocations and persistent data are arranged in a particular runtime realization of that machine.**
 
-```yaml
-revision: 1
-```
+L1 is **optional**. An L0-only model is complete, structurally valid, and analyzable. Removing L1 from a valid model never makes it invalid: it only makes proofs that consumed runtime facts unavailable. The verifier records the **scope** of every proof it produces: `l0_only` when no L1 fact was required, or `runtime_dependent` when at least one was necessary.
 
-### `services`
+<Info>
+  A `runtime_dependent` proof is not weaker in kind; it is conditional on the declared realization, and must be re-examined when that realization changes.
+</Info>
 
-`services` declares the logical ownership boundaries in your system. Every operation belongs to exactly one service. Services are descriptive groupings only; they imply no process boundary, network hop, or trust boundary. See [Services & Schemas](/concepts/services-and-schemas) for the four available service kinds.
+## The seven L0 root collections
 
-```yaml
-services:
-  service.checkout:
-    kind: backend
-  service.payments:
-    kind: worker
-```
+A model root contains these top-level keys:
 
-### `schemas`
+- **`services`** : Logical ownership and grouping boundaries for operations. Kinds are descriptive only (`backend`, `frontend`, `worker`, `job`); a service does not imply a process boundary, network hop, replica count, or trust boundary.
+- **`schemas`** : Canonical and fragment schemas that describe the logical shape of values. Includes scalar types, lists, optional flags, and field-path shorthand.
+- **`data_models`** : Logical transactional state boundaries containing persistent objects and [outboxes](/concepts/data-models-and-outboxes).
+- **`topics`** : Logical message channels that declare which schemas they may carry and what identifies one logical message. See [Topics and messaging](/concepts/topics-and-messaging).
+- **`state_machines`** : Legal states and transitions for a persistent object field. Each transition may declare shared side-effect contracts.
+- **`operations`** : Logical units of application behavior with inputs, a single acausal program, and requirements. See [Operations](/concepts/operations).
+- **`revision`** : An opaque numeric revision marker for the model snapshot. The current DSL assigns no ordering, compatibility, or migration semantics beyond numeric identity.
 
-`schemas` declares the logical value shapes used throughout the model — request payloads, event messages, data object states, and response types. There are two kinds: `canonical` schemas define a shape directly; `fragment` schemas project fields from a canonical schema. See [Services & Schemas](/concepts/services-and-schemas) for full field-type syntax.
+## What belongs in L1
 
-```yaml
-schemas:
-  schema.OrderCreated:
-    kind: canonical
-    completeness: complete
-    fields:
-      event_id: string
-      order_id: uuid
-      quantity: int
-```
+When `runtime` is present, it may contain:
 
-### `data_models`
-
-`data_models` declares the logical transactional state boundaries in your system. Each data model contains one or more `DataObject` declarations — persistent entities with a canonical schema and a composite identity. Transactions in operations reference a data model to declare which shared transactional boundary they operate against.
-
-```yaml
-data_models:
-  data.checkout:
-    objects:
-      object.order:
-        schema: schema.OrderRecord
-        identity:
-          - order_id
-```
-
-### `topics`
-
-`topics` declares the message channels that operations publish to and subscribe from. A topic declares which schemas it carries, what ordering guarantee it provides, and whether messages have a declared identity. See [Topics & Messaging](/concepts/topics-and-messaging).
-
-```yaml
-topics:
-  topic.order_events:
-    messages:
-      - schema.OrderCreated
-    ordering:
-      kind: keyed
-      mapping:
-        schema.OrderCreated: order_id
-    message_identity:
-      kind: unspecified
-```
-
-### `state_machines`
-
-`state_machines` declares persistent state-transition graphs over data objects. A state machine names a subject object, an enumerated set of states, an initial state, and a set of transitions (each with optional publication or request side effects). Transitions fire inside operation transactions. See [State Machines](/concepts/state-machines).
-
-```yaml
-state_machines:
-  machine.order_lifecycle:
-    subject:
-      kind: object
-      object: object.order
-      state: status
-    states:
-      - state.order.pending
-      - state.order.paid
-      - state.order.cancelled
-    initial: state.order.pending
-    transitions:
-      transition.order.cancel:
-        from:
-          - state.order.pending
-        to: state.order.cancelled
-        side_effects: {}
-```
-
-### `operations`
-
-`operations` is the main section. Each operation declares a logical unit of behavior: its owning service, possible inputs (synchronous requests or topic subscriptions), one explicit causal program that inlines transactions, direct effects, effect intents, and transaction outputs at their execution sites, and correctness requirements. See [Operations](/concepts/operations) and [Requirements](/concepts/requirements).
-
-## Minimal model skeleton
-
-The following model satisfies the structural contract with all sections present. Use it as a starting point before filling in your own services, schemas, and operations.
-
-```yaml
-revision: 1
-
-services:
-  checkout:
-    kind: backend
-
-schemas:
-  OrderCreated:
-    kind: canonical
-    description: An order accepted by checkout.
-    completeness: complete
-    fields:
-      order_id: uuid
-      quantity: int
-
-data_models: {}
-
-topics:
-  order_events:
-    messages:
-      - OrderCreated
-    ordering:
-      kind: unordered
-    message_identity:
-      kind: unspecified
-
-state_machines: {}
-
-operations: {}
-```
+- **`topics`** : `TopicRuntime` declarations with optional `grouping` and `ordering`.
+- **`subscriptions`** : `SubscriptionRuntime` declarations per `(operation, input)` pair, covering `delivery`, `grouping`, `ordering`, and `dispatch`.
+- **`outboxes`** : `OutboxRuntime` declarations per `(operation, input)` pair, covering `delivery`, `partitioning`, `ordering`, `dispatch`, and `batching`.
+- **`execution_pools`** : Logical populations of interchangeable runtime members with `member_concurrency`.
+- **`routers`** : Request routing from a boundary to a pool, with an optional semantic routing key.
+- **`storage_layouts`** : Physical partition identity for a `DataObject`.
 
 <Note>
-All seven top-level keys must be present. The six map sections (`services`, `schemas`, `data_models`, `topics`, `state_machines`, `operations`) may be empty (`{}`); `revision` must be a numeric value. Omitting any key is a validation error.
+  Grouping and ordering are declared at exactly one of two scopes for a given topic: either once at the topic runtime, or independently at each subscription runtime. They are never declared at both. There is no inheritance, no override, and no fallback chain. See [Topic and subscription runtime](/runtime/topic-and-subscription-runtime).
 </Note>
 
-## Three semantic categories
+## Semantic categories
 
-Every declaration in a Conseqa model belongs to one of three categories. Understanding the distinction is essential for reading verification results correctly.
+Independently of layer, a declaration belongs to one of three categories:
 
-| Category | What it means | Examples |
-|---|---|---|
-| **Structural fact** | Describes what the modeled system can do or how entities relate | operations, transactions, schemas, effects |
-| **Implementation guarantee** | A fact the model claims the implementation provides; the verifier may rely on it | topic ordering, delivery semantics, transaction isolation, deduplication keys |
-| **Requirement / obligation** | A property that must hold; declaring it does NOT assert it is already satisfied | serialization, ordering, idempotency, recoverability |
+| Category | Meaning | Examples |
+| --- | --- | --- |
+| **Structural fact** | Describes what the modeled program can do or how entities relate. | operations, programs, effects, transactions, result contracts, schemas |
+| **Implementation guarantee / assumption** | A fact the model claims the implementation provides. The verifier may rely on it, subject to conformance. | topic transport ordering, member assignment, transaction isolation, effect idempotency |
+| **Requirement / obligation** | A property the architecture says must hold. It is **not** a guarantee merely because it is declared. | operation serialization, ordering, idempotency, result replay consistency, recoverability |
 
-A structurally valid model is not necessarily a correct model. Validation checks coherence; verification checks whether declared requirements follow from declared facts.
+A structurally valid model is therefore not necessarily a safe model. Validation establishes that declarations are coherent and references are meaningful. Verification establishes whether the declared requirements follow from the declared facts and architecture.
 
-## What `unspecified` means
+## `unspecified` is epistemic
 
-Throughout the model, `unspecified` means: *the model provides no fact from which this property may be inferred*. It does not mean the property is false, and it does not permit a violation. It means the verifier must treat the value as unknown and cannot use it as evidence for a proof.
+Across the DSL, `unspecified` means:
 
-## Explore the concepts
+> The model provides no fact from which the corresponding property may be inferred.
 
-<CardGroup cols={2}>
-  <Card title="Services & Schemas" icon="layer-group" href="/concepts/services-and-schemas">
-    Service kinds, canonical and fragment schemas, field types, and data models
-  </Card>
-  <Card title="Operations" icon="bolt" href="/concepts/operations">
-    Inputs, causal programs (with inline transactions and effects), and execution concurrency
-  </Card>
-  <Card title="Transactions" icon="database" href="/concepts/transactions">
-    Inline atomic execution, isolation, step kinds, and transaction-output bindings
-  </Card>
-  <Card title="Topics & Messaging" icon="envelope" href="/concepts/topics-and-messaging">
-    Message channels, ordering guarantees, delivery semantics, and dispatch
-  </Card>
-  <Card title="State Machines" icon="diagram-project" href="/concepts/state-machines">
-    Persistent state transitions, side effects, and lifecycle modeling
-  </Card>
-  <Card title="Requirements" icon="shield-check" href="/concepts/requirements">
-    Serialization, ordering, idempotency, and recoverability obligations
-  </Card>
-</CardGroup>
+It does **not** mean that the property is false, and it does not mean the implementation is allowed to violate a requirement. It means the verifier must treat the fact as unknown. An unknown fact cannot be used as evidence for a proof.
+
+For example, `ordering: unspecified` does not prove messages are unordered. `concurrency: unspecified` does not prove concurrent execution exists. `idempotency: unspecified` does not prove an external effect is non-idempotent.
+
+## Removing runtime facts
+
+Deleting the runtime model from a valid model leaves it valid. Requirements discharged from runtime facts become **unproven** (never violated, and never a structural error). That asymmetry is the point of the layering: L0 stands alone, and L1 is what a particular realization adds.
+
+For the full runtime vocabulary, see [Runtime overview](/runtime/overview).

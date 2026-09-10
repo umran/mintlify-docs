@@ -32,11 +32,22 @@
             "pages": [
               "concepts/model-overview",
               "concepts/services-and-schemas",
+              "concepts/data-models-and-outboxes",
               "concepts/operations",
               "concepts/transactions",
               "concepts/topics-and-messaging",
               "concepts/state-machines",
               "concepts/requirements"
+            ]
+          },
+          {
+            "group": "Runtime Topology",
+            "pages": [
+              "runtime/overview",
+              "runtime/topic-and-subscription-runtime",
+              "runtime/outbox-runtime",
+              "runtime/routers-and-pools",
+              "runtime/storage-layouts"
             ]
           },
           {
@@ -46,6 +57,7 @@
               "dsl/field-types",
               "dsl/effects",
               "dsl/program-control",
+              "dsl/async-effects",
               "dsl/value-references"
             ]
           },

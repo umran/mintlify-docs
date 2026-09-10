@@ -1,0 +1,138 @@
+---
+title: "Routers and Execution Pools: Request Routing and Concurrency"
+sidebarTitle: "Routers & Pools"
+description: "Route request inputs into execution pools and declare per-member concurrency in Conseqa L1 runtime topology."
+---
+
+Routers and execution pools describe how request invocations reach runtime members and how many of those members can execute at once. These declarations sit under `Model.runtime.routers` and `Model.runtime.execution_pools`.
+
+<Warning>
+  Operations no longer declare execution concurrency. All runtime concurrency lives in exactly one place: `ExecutionPool.member_concurrency`.
+</Warning>
+
+## Router
+
+A router describes how invocations entering through one request input are assigned into an execution pool.
+
+```yaml
+runtime:
+  routers:
+    <router_id>:
+      boundary:
+        operation: <operation_id>
+        input: <input_id>
+      pool: <execution_pool_id>
+      routing?:                              # optional
+        key: [<field_path>, ...]             # non-empty
+        member_assignment:
+          kind: consistent_hash
+```
+
+One request boundary has at most one router. The router does not choose which operation executes; that is fixed by the L0 request boundary. It answers:
+
+> Which member of the target execution pool owns the semantic routing domain of this request invocation?
+
+The key is a list of field paths evaluated against the request input schema. Two invocations belong to the same routing domain exactly when their evaluated key tuples are equal.
+
+### Router without routing
+
+A router that omits `routing` means: "invocations of this boundary execute within this pool," with no member-affinity fact. This is the sole representation of unspecified member routing.
+
+```yaml title="Router without routing"
+runtime:
+  routers:
+    router.health:
+      boundary:
+        operation: op.health
+        input: input.request
+      pool: pool.web
+```
+
+## ExecutionPool
+
+```yaml
+runtime:
+  execution_pools:
+    <pool_id>:
+      member_concurrency: unspecified | unbounded | bounded
+```
+
+```yaml title="bounded concurrency"
+member_concurrency:
+  kind: bounded
+  value: 1
+```
+
+### Pool identity
+
+If two execution paths target the same pool, they share one logical runtime execution population. If they target different pools, they target distinct logical populations. This implies nothing about physical hosts, processes, deployments, or failure domains.
+
+### member_concurrency
+
+| Value | Meaning |
+| --- | --- |
+| `bounded(n)` | At most `n` operation invocations assigned to one member may be simultaneously active, across all operations and ingress mechanisms. |
+| `bounded(1)` | The serialization case: one member executes at most one invocation at a time. |
+| `unbounded` | No finite member-level execution bound may be assumed. |
+| `unspecified` | No usable fact about simultaneous execution on one member. |
+
+Unlike routing, member concurrency distinguishes genuinely unknown from explicitly unconstrained, so it keeps both negative states.
+
+<Note>
+  A pool carries no member count, CPU, memory, host count, or autoscaling rule. Numbers belong in the external simulation scenario.
+</Note>
+
+## MemberAssignment
+
+```yaml
+member_assignment:
+  kind: consistent_hash | round_robin
+```
+
+### consistent_hash
+
+Equal routing domains are owned by the same execution-pool member during a stable ownership epoch. Different domains may share a member. Conseqa prescribes no hash function or discovery mechanism; the declaration specifies semantic behavior.
+
+### round_robin
+
+Each invocation goes to the next member in rotation, irrespective of routing domain. No correctness proof consumes it, but it is essential for external quantitative analysis: a skewed key distribution concentrates load under consistent hash while round_robin spreads it evenly and destroys locality.
+
+`round_robin` is also diagnostic. A serialization or ordering requirement over such a boundary is refused with a reason (`rotation puts same-key invocations on different members`) rather than for want of a declaration nobody has made. Routing absence yields no member affinity at all; `round_robin` says affinity is known not to exist.
+
+### Safe ownership transfer
+
+Any member assignment used to establish keyed serialization must preserve exclusive ownership through reassignment. A conforming runtime must not permit the old and new owners of a domain to execute it in a manner that violates one-owner semantics.
+
+## Full example
+
+```yaml title="Router and pool example"
+runtime:
+  routers:
+    router.update_account:
+      boundary:
+        operation: op.update_account
+        input: input.request
+      pool: pool.account_workers
+      routing:
+        key:
+          - account_id
+        member_assignment:
+          kind: consistent_hash
+  execution_pools:
+    pool.account_workers:
+      member_concurrency:
+        kind: bounded
+        value: 1
+```
+
+## What pools do NOT carry
+
+- No cardinality or replica count
+- No CPU, memory, or host counts
+- No autoscaling rules or container counts
+
+These quantitative values belong in the external simulation scenario evaluated against the architecture, not in the Conseqa declarations themselves.
+
+<Tip>
+  For how transport ordering and dispatch connect to pools, see [Topic and Subscription Runtime](/runtime/topic-and-subscription-runtime).
+</Tip>

@@ -1,0 +1,129 @@
+---
+title: "Outbox Runtime: Consumption and Dispatch Semantics"
+sidebarTitle: "Outbox Runtime"
+description: "Declare delivery, partitioning, ordering, dispatch, and batching for outbox consumers in Conseqa L1 runtime topology."
+---
+
+Outbox runtime facts describe how committed messages from a `DataModel.outbox` are consumed, ordered, and dispatched into execution. They are addressed by the `(operation, input)` pair for an `OutboxInput` and declared under `Model.runtime.outboxes`. An outbox runtime is deliberately its own semantic concept, not a subscription runtime with relabeled fields.
+
+<Info>
+  Outboxes are L0 entities declared inside a `DataModel`. They carry no runtime facts of their own. All consumption semantics live in L1 under `runtime.outboxes`.
+</Info>
+
+## OutboxRuntime shape
+
+```yaml
+runtime:
+  outboxes:
+    <operation_id>:
+      <input_id>:
+        delivery: unspecified | at_most_once | at_least_once
+        partitioning:
+          kind: none | keyed
+          mapping?:                 # required when kind = keyed
+            <schema_id>:
+              - <field path>
+        ordering: none | global | partition
+        dispatch:
+          pool: <execution_pool_id>
+          member_assignment:
+            kind: consistent_hash | round_robin
+          batching?:
+            ordering: preserved | unspecified
+```
+
+Each of several inputs on one outbox declares its own runtime. Absence of the whole declaration is epistemic: no usable runtime facts are provided.
+
+## Delivery
+
+Delivery vocabulary matches subscription runtime exactly:
+
+| Value | Meaning |
+| --- | --- |
+| `unspecified` | No usable delivery fact. |
+| `at_most_once` | No redelivery; loss is possible; not exactly once. |
+| `at_least_once` | Duplicate invocation possible; encodes no retry timing, count, or eventual-success guarantee. |
+
+Where `acknowledge_on_success = true` on the input, a successful acknowledged invocation ends ordinary redelivery for that item for this consumer. Failure or uncertainty before acknowledgement may still admit another attempt under `at_least_once`.
+
+## Partitioning
+
+Partition identity is the outbox's one runtime grouping concept. It is the logical grouping identity used for runtime consumption.
+
+- **`none`**: one undivided consumption domain for this consumer. Declares no physical singularity.
+- **`keyed`**: maps each consumed schema into the common logical partition-key domain under the familiar tuple rules: per-schema field mappings, corresponding positions, one arity. Only schemas admitted through the targeted input need participate.
+
+The keyed meaning is exactly:
+
+> `partition_key(A) = partition_key(B)` implies `partition(A) = partition(B)`
+
+and nothing further. Not ordering, not serialization, not member assignment, not execution affinity.
+
+## Ordering
+
+| Value | Meaning |
+| --- | --- |
+| `none` | No usable precedence among consumed messages. |
+| `global` | One order over everything this runtime consumes. |
+| `partition` | An independent order within each keyed partition, none between partitions. Requires keyed partitioning. |
+
+A declared order neither implies that invocations cannot overlap nor establishes business causality between producing operations.
+
+## Dispatch
+
+```text
+outbox message
+    |  partition key
+    v
+outbox partition
+    |  member assignment
+    v
+ExecutionPool member
+```
+
+`member_assignment` is mandatory and carries the same semantics as for routers and subscriptions, including safe ownership transfer during reassignment. No polling primitive is prescribed: a conforming realization may poll a table, tail a CDC stream, or consume a broker without changing the model.
+
+Dispatch preserves precedence and never invents it, including through failure-driven redelivery and ownership reassignment.
+
+## Batching
+
+`batching` is an explicit declaration that this consumer may retrieve or dispatch several logical source items together. L0 is untouched: each item remains one logical per-message invocation.
+
+The only semantic field is `ordering`, explicit with no default:
+
+- `preserved`: the opaque batch processing does not let a later message overtake an earlier one against an already-established ordering relation.
+- `unspecified`: no evidence the order survives the stage.
+
+<Warning>
+  Preservation is **not** a serialization guarantee. Opaque batch processing may still overlap logical item evaluations, which is why a declared batching stage stops a serialization proof outright while an ordering proof accepts `preserved`. `member_concurrency` must not be silently read as a fact about batch-internal parallelism.
+</Warning>
+
+## Full example
+
+```yaml title="OutboxRuntime example"
+runtime:
+  outboxes:
+    op.publish_order_event:
+      input.publish_order_event.outbox:
+        delivery: at_least_once
+        partitioning:
+          kind: keyed
+          mapping:
+            schema.OrderCreated:
+              - tenant_id
+        ordering: partition
+        dispatch:
+          pool: pool.outbox_workers
+          member_assignment:
+            kind: consistent_hash
+          batching:
+            ordering: preserved
+```
+
+## Atomicity
+
+A transaction that writes to an outbox commits atomically with its object mutations. If the transaction commits, the message is durably admitted. If the transaction aborts, neither mutations nor the message survive. The outbox write itself is performed via the `write_outbox` transaction step, which is the only legal site for outbox writes. See [Effects](/dsl/effects) for the `OutboxWriteEffect` contract and [Data Models and Outboxes](/concepts/data-models-and-outboxes) for the L0 declaration.
+
+<Tip>
+  To understand how `MemberAssignment` and `ExecutionPool` work, see [Routers and Pools](/runtime/routers-and-pools).
+</Tip>

@@ -1,18 +1,21 @@
 ---
-title: "Understanding Verification Verdicts and Proof Status"
+title: "Verification Verdicts: Proven, Unknown, and Disproven"
 sidebarTitle: "Verdicts"
-description: "Conseqa produces three verdicts — proven, unknown, disproven — describing what the verifier can establish from your declared model, not runtime behavior."
+description: "Conseqa produces three verdicts — proven, unknown, disproven — and records proof scope (l0_only or runtime_dependent) and the declarations consumed as evidence. Removing L1 cannot invalidate a proof; it turns runtime_dependent into unproven."
 ---
 
-Every verification obligation Conseqa produces carries one of three verdicts: `proven`, `unknown`, or `disproven`. These are **epistemic** statements about the declared facts in your model. They describe what the verifier can or cannot establish, not what the running system has been observed to do.
+Every verification obligation Conseqa produces carries one of three verdicts: `proven`, `unknown`, or `disproven`. These are **epistemic** statements about the declared facts in your model. They describe what the verifier can or cannot establish, not what the running system has been observed to do. Additionally, every proof records its **scope** (`l0_only` or `runtime_dependent`) and the **evidence** (declarations consumed) that the argument relied on.
 
 ## The Three Verdicts
 
 ### `proven`
 
-The verifier has established that the declared requirement follows from the facts in your model. The proof names the specific declarations it relies on — topic ordering, dispatch routing, transaction isolation, keyed commit deduplication, external idempotency guarantees, and so on — in the obligation's `assumptions` list.
+The verifier has established that the declared requirement follows from the facts in your model. The proof names the specific declarations it relies on in the obligation's `assumptions` list, and records its `scope`:
 
-A `proven` verdict is **conditional on implementation conformance**. If your real implementation does not actually provide the semantics you declared — for example, you declared `deduplicated_by` but the execution environment does not enforce it — the proof is invalid. Conseqa verifies what you declare, not what you build.
+- **`l0_only`** — no L1 fact was required. The proof rests entirely on the abstract application machine.
+- **`runtime_dependent`** — at least one L1 fact was necessary. The proof holds of the declared runtime realization and must be re-examined whenever that realization changes.
+
+A `proven` verdict is **conditional on implementation conformance**. If your real implementation does not actually provide the semantics you declared (for example, you declared `deduplicated_by` but the execution environment does not enforce it), the proof is invalid. Conseqa verifies structure; conformance to the model is your responsibility.
 
 ### `unknown`
 
@@ -40,33 +43,52 @@ The verifier has found a counterexample — a concrete trace within the declared
 In the current V1 engine, `disproven` obligations are reserved in the format and may appear in future releases. The present engine raises `unknown` rather than `disproven` for gaps it cannot close.
 </Info>
 
+## Proof Scope
+
+Every proof records the semantic layers its argument consumed:
+
+| Scope | Meaning |
+| --- | --- |
+| `l0_only` | No explicit L1 fact was required. The proof rests on the abstract application machine. |
+| `runtime_dependent` | At least one L1 fact was necessary. The proof holds of the declared runtime realization. |
+
+The scope records a **dependency**, nothing more. A `runtime_dependent` proof is not weaker in kind; it is conditional on the runtime realization the model declares, and must be re-examined when that realization changes. Changing a pool's `member_concurrency`, or dropping a router's routing block, invalidates the proofs that cited them, and the scope is how a reader finds them.
+
+`l0_only` does **not** mean implementation-free. A proof resting on `isolation: serializable` is L0-only, and still assumes the concrete database implements serializable execution. Scope identifies dependency on semantic layers, not the absence of conformance assumptions.
+
+## Removing L1 Cannot Invalidate a Proof
+
+Deleting the `runtime` block from a valid model leaves it valid. Requirements discharged from runtime facts become **unproven** — never violated, and never a structural error. That asymmetry is the point of the layering: L0 stands alone, and L1 is what a particular realization adds.
+
+Conversely, adding L1 to an L0-only model can turn previously `unknown` obligations into `proven` (or leave them `unknown` if the new facts are insufficient). The scope badge on each obligation tells you which category it belongs to.
+
 ## Declarations That Are Not Verdicts
 
 Several DSL values affect what the verifier can infer but are themselves declarations, not verdicts.
 
 ### `unspecified`
 
-`unspecified` in any field means: *the model provides no fact from which this property may be inferred*. It does not mean the property is false. An `unspecified` fact cannot be used as evidence in any proof, so a proof that would require it produces `unknown` rather than `proven`.
+`unspecified` in any field means: the model provides no fact from which this property may be inferred. It does not mean the property is false. An `unspecified` fact cannot be used as evidence in any proof, so a proof that would require it produces `unknown` rather than `proven`.
 
 Examples:
-- `ordering: unspecified` on a topic does not prove messages are unordered.
-- `concurrency: unspecified` on an operation does not prove unbounded concurrency.
+- `ordering: unspecified` on a topic runtime does not prove messages are unordered.
+- `member_concurrency: unspecified` on a pool does not prove concurrent execution exists.
 - `idempotency: unspecified` on an external effect does not prove repeated calls are unsafe.
 
 ### `unordered`, `unbounded`, `not_deduplicated`
 
-These are explicit negative declarations — stronger than `unspecified` because they actively assert the absence of a guarantee. Even so, they describe declared guarantees, not observed runtime behavior:
+These are explicit negative declarations — stronger than `unspecified` because they actively assert the absence of a guarantee. Even so, they describe declared guarantees, not necessarily observed runtime behavior:
 
 - `unordered` says the topic provides no ordering guarantee. It does not mean messages are never delivered in order in practice.
 - `not_deduplicated` on a transaction or external effect says no keyed deduplication is provided. It does not mean every duplicate invocation causes harm at runtime.
 
-The verifier uses these declarations to close proofs that would otherwise be `unknown` in the negative direction. For example, `not_deduplicated` on an external effect causes any idempotency requirement that reaches that effect on a retryable path to be `unknown` — the gap is now explicitly declared rather than merely absent.
+The verifier uses these declarations to close proofs that would otherwise be `unknown` in the negative direction.
 
 ## Coinductive Verdicts
 
 Some `proven` obligations are marked **coinductive** in the report. This means the proof was established by greatest-fixpoint analysis over a cycle of mutually dependent requirements.
 
-A coinductive proof arises when two or more operations each depend on the other's idempotency verdict — for example, operation A makes a request to operation B, and B makes a request back to A. The V1 engine assumes all requirements and drops those that fail; a cycle whose members each pass their local checks under the mutual assumption is proven. The coinductive label records that the proof rests on this mutual assumption rather than on independent evidence.
+A coinductive proof arises when two or more operations each depend on the other's idempotency verdict — for example, operation A makes a request to operation B, and B makes a request back to A. The V1 engine assumes all requirements and drops those that fail; a cycle whose members each pass their local checks under the mutual assumption is proven. The coinductive label records that the proof rests on this mutual assumption rather than on independent evidence. Cycles through outboxes are treated identically to cycles through topics or requests; there is no separate outbox solver.
 
 <Tip>
 Coinductive proofs are sound. The minimal-counterexample argument in the semantics contract establishes that a self-consistent set of requirements cannot contain an actual violation. The label is informational — it tells you the proof structure, not that the proof is weaker.
@@ -76,7 +98,7 @@ Coinductive proofs are sound. The minimal-counterexample argument in the semanti
 
 <CardGroup cols={2}>
   <Card title="proven" icon="circle-check">
-    Confirm that your implementation actually provides the declared facts the proof relies on. The `assumptions` list in the obligation report names them exactly.
+    Confirm that your implementation actually provides the declared facts the proof relies on. The `assumptions` list in the obligation report names them exactly. Check the `scope` badge to see whether the proof is `l0_only` or `runtime_dependent`.
   </Card>
   <Card title="unknown" icon="circle-question">
     Read the `evidence` list. Decide whether to declare the missing fact, restructure the operation, or accept the gap. Re-run Conseqa after any change.
@@ -85,7 +107,7 @@ Coinductive proofs are sound. The minimal-counterexample argument in the semanti
     Inspect the `counterexample` trace. Revise the model or the implementation to eliminate the demonstrated violation.
   </Card>
   <Card title="coinductive" icon="arrows-rotate">
-    Verify that the mutually dependent cycle in your architecture is genuinely self-consistent — each operation in the cycle really does collapse duplicates from the others.
+    Verify that the mutually dependent cycle in your architecture is genuinely self-consistent — each operation in the cycle really does collapse duplicates from the others, including through outbox cascades.
   </Card>
 </CardGroup>
 
@@ -93,7 +115,7 @@ Coinductive proofs are sound. The minimal-counterexample argument in the semanti
 
 The `flash_checkout` example model ships with a genuine report that illustrates both outcomes:
 
-**10 proven obligations** — including serialization, ordering, and recoverability for `apply_payment` and `create_order`, and result replay for `create_order`. These operations use keyed commits, identified events, and `by_topic_key` dispatch with `bounded(1)` lane concurrency.
+**10 proven obligations** — including serialization, ordering, and recoverability for `apply_payment` and `create_order`, and result replay for `create_order`. These operations use keyed commits, identified events, and `by_topic_key` dispatch with `bounded(1)` member concurrency.
 
 **4 unknown obligations** — including idempotency for `reserve_inventory`, `charge_payment`, and `create_order`. The root causes:
 

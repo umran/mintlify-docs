@@ -1,10 +1,10 @@
 ---
 title: "Quickstart: Verify Your First Conseqa Model in Minutes"
 sidebarTitle: "Quickstart"
-description: "Install Conseqa, write a minimal YAML model, run the verifier, and generate an interactive visualization — all in a single walkthrough."
+description: "Install Conseqa, write a minimal YAML model with a transactional outbox, run the verifier, and generate an interactive visualization."
 ---
 
-This guide walks you through installing Conseqa from source, writing a minimal model, running your first verification, and exploring the result in the interactive visualizer. By the end you will have a working model on disk and know how to extend it.
+This guide walks you through installing Conseqa from source, writing a minimal model, running your first verification, and exploring the result in the interactive visualizer. The model starts with the application itself and then adds a small amount of runtime topology so serialization can be proved. By the end you will have a working model on disk and know how to extend it.
 
 <Steps>
   <Step title="Install Conseqa">
@@ -42,15 +42,15 @@ This guide walks you through installing Conseqa from source, writing a minimal m
   </Step>
 
   <Step title="Write a minimal model">
-    Create a file called `model.yaml`. The model below declares a single `backend` service, a canonical schema for a completed upload, and a keyed topic that carries it. It has no operations or requirements yet, so there is nothing to verify — but it is a valid, parseable starting point.
+    Create a file called `model.yaml`. The model below declares a single `backend` service, a canonical schema for a completed upload, a data model with an outbox for typed messages, a keyed topic, and a complete operation. A short `runtime` block at the end pins request routing and pool concurrency so the operation's serialization requirement can be discharged.
 
     ```yaml
     revision: 1
-
+    
     services:
       service.ingest:
         kind: backend
-
+    
     schemas:
       schema.UploadCompleteRequest:
         kind: canonical
@@ -61,7 +61,7 @@ This guide walks you through installing Conseqa from source, writing a minimal m
           video_id: uuid
           owner_id: uuid
           source_uri: string
-
+    
       schema.VideoUploaded:
         kind: canonical
         description: A new source video is available for transcoding.
@@ -71,27 +71,150 @@ This guide walks you through installing Conseqa from source, writing a minimal m
           video_id: uuid
           owner_id: uuid
           source_uri: string
-
-    data_models: {}
-
+    
+    data_models:
+      data.videos:
+        objects: {}
+        outboxes:
+          outbox.video_events:
+            messages:
+              - schema.VideoUploaded
+            message_identity:
+              kind: keyed
+              mapping:
+                schema.VideoUploaded:
+                  - event_id
+    
     topics:
       topic.video_events:
         messages:
           - schema.VideoUploaded
-        ordering:
-          kind: keyed
-          mapping:
-            schema.VideoUploaded: video_id
         message_identity:
           kind: keyed
           mapping:
             schema.VideoUploaded:
               - event_id
-
+    
     state_machines: {}
-
-    operations: {}
+    
+    operations:
+      operation.complete_upload:
+        service: service.ingest
+        inputs:
+          input.complete_upload.request:
+            kind: request
+            schema: schema.UploadCompleteRequest
+            identity:
+              kind: keyed
+              fields:
+                - upload_id
+            result:
+              ok: schema.VideoUploaded
+              err:
+                schema: schema.RequestRejected
+                disposition: terminal
+        program:
+          steps:
+            - kind: transaction
+              id: tx.complete_upload
+              data_model: data.videos
+              isolation: read_committed
+              idempotency:
+                kind: deduplicated_by
+                key:
+                  components:
+                    - source: input:input.complete_upload.request
+                      path: upload_id
+              steps:
+                - kind: write_outbox
+                  effect_id: effect.complete_upload.outbox
+                  effect:
+                    outbox: outbox.video_events
+                    schema: schema.VideoUploaded
+                    idempotency_key_propagation:
+                      - source:
+                          components:
+                            - source: input:input.complete_upload.request
+                              path: upload_id
+                        target:
+                          components:
+                            - source: effect:effect.complete_upload.outbox
+                              path: event_id
+                  values:
+                    kind: deterministic
+                    from:
+                      - source: input:input.complete_upload.request
+                        path: upload_id
+                      - source: input:input.complete_upload.request
+                        path: video_id
+                      - source: input:input.complete_upload.request
+                        path: owner_id
+                      - source: input:input.complete_upload.request
+                        path: source_uri
+                - kind: establish_transaction_output
+                  bind: output.complete_upload
+                  schema: schema.VideoUploaded
+                  values:
+                    kind: deterministic
+                    from:
+                      - source: input:input.complete_upload.request
+                        path: video_id
+                      - source: input:input.complete_upload.request
+                        path: owner_id
+                      - source: input:input.complete_upload.request
+                        path: source_uri
+            - kind: return
+              request: input.complete_upload.request
+              outcome:
+                kind: ok
+                values:
+                  kind: deterministic
+                  from:
+                    - source: transaction_output:output.complete_upload
+                      path: video_id
+                    - source: transaction_output:output.complete_upload
+                      path: owner_id
+                    - source: transaction_output:output.complete_upload
+                      path: source_uri
+        requirements:
+          idempotency:
+            - key:
+                components:
+                  - source: input:input.complete_upload.request
+                    path: upload_id
+              result: replay_consistent
+          recoverability:
+            - key:
+                components:
+                  - source: input:input.complete_upload.request
+                    path: upload_id
+              completion: resumable
+    
+    runtime:
+      execution_pools:
+        pool.web:
+          member_concurrency:
+            kind: bounded
+            value: 1
+      routers:
+        router.complete_upload:
+          boundary:
+            operation: operation.complete_upload
+            input: input.complete_upload.request
+          pool: pool.web
+          routing:
+            key:
+              - upload_id
+            member_assignment:
+              kind: consistent_hash
     ```
+
+    Each block serves a specific purpose:
+
+    1. **Data model with an outbox** (`data_models.data.videos.outboxes.outbox.video_events`): A typed logical message collection that lives in the same transactional boundary as the data model's objects. The transaction can atomically write objects and admit messages to this outbox in one commit.
+    2. **Topic** (`topics.topic.video_events`): A logical channel that carries `schema.VideoUploaded` with keyed message identity on `event_id`.
+    3. **Operation** (`operations.operation.complete_upload`): A request-driven operation with a transaction containing `deduplicated_by` on the request's `upload_id`, a `write_outbox` step staging `VideoUploaded` atomically, and an `establish_transaction_output` step exporting values for the return.
+    4. **Runtime** (`runtime.execution_pools` and `runtime.routers`): Realization facts. A serial execution pool plus a router that assigns request invocations onto that pool by consistent hash of `upload_id`. Adding these lets the verifier discharge the operation's serialization requirement.
 
     <Tip>
       The `completeness: complete` declaration tells the verifier this schema describes the full logical shape. Fields absent from a complete schema are treated as nonexistent. Use `partial` when the real schema may contain undeclared fields.
@@ -105,20 +228,20 @@ This guide walks you through installing Conseqa from source, writing a minimal m
     conseqa model.yaml
     ```
 
-    With no operations declared, there are no requirements to discharge:
+    With the model above, the verifier checks idempotency and recoverability obligations and reports their verdicts:
 
     ```text
-    obligations: 0 proven, 0 unknown, 0 disproven (0 total)
+    obligations: 2 proven, 0 unknown, 0 disproven (2 total)
     ```
 
-    Now try the fuller example from the repository's test fixtures, which models a complete video streaming pipeline with four services and every obligation proven:
+    Now try the fuller example from the repository's test fixtures, which models a transactional outbox with a relay and downstream consumer:
 
     ```bash
-    conseqa tests/fixtures/video_streaming.yaml
+    conseqa tests/fixtures/transactional_outbox.yaml
     ```
 
     ```text
-    obligations: 8 proven, 0 unknown, 0 disproven (8 total)
+    obligations: 6 proven, 0 unknown, 0 disproven (6 total)
     ```
 
     For a model with deliberate gaps, run the flash checkout fixture. The checker reports each gap honestly:
@@ -132,7 +255,7 @@ This guide walks you through installing Conseqa from source, writing a minimal m
     ```
 
     <Note>
-      `unknown` is epistemic — it means the verifier could not establish the property from the declared facts. It is not evidence of a violation. The flash checkout model deliberately leaves `tx.reserve_inventory` without keyed-commit deduplication, which is why its idempotency and recoverability obligations are unknown.
+      `unknown` is epistemic: the verifier could not establish the property from the declared facts. It is not evidence of a violation. The flash checkout model deliberately leaves gaps in recoverability and idempotency for illustration.
     </Note>
 
     To save the full obligation report as JSON for later use or visualization:
@@ -146,7 +269,7 @@ This guide walks you through installing Conseqa from source, writing a minimal m
     wrote video_streaming.report.json
     ```
 
-    The JSON report follows the `ProverReport` format (`format: 2`). Each obligation object carries an `id`, `property`, `subject`, `status`, `summary`, `assumptions`, and `evidence` array.
+    The JSON report follows the `ProverReport` format (`format: 2`). Each obligation object carries an `id`, `property`, `subject`, `status`, `summary`, `assumptions`, `evidence`, and `scope` (`l0_only` or `runtime_dependent`).
   </Step>
 
   <Step title="Generate a visualization">

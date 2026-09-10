@@ -1,0 +1,85 @@
+---
+title: "Storage Layouts: Physical Partitioning for Data Objects"
+sidebarTitle: "Storage Layouts"
+description: "Declare storage partition identity for Conseqa data objects. Partition keys and routing keys are distinct concepts, and the analyzer never infers equivalence between them."
+---
+
+A storage layout describes physical partition identity for one L0 data object. Object identity and storage identity are deliberately separate concepts. A `StorageLayout` is declared under `Model.runtime.storage_layouts`.
+
+<Info>
+  V1 admits at most one primary layout per object. A layout implies nothing about database vendor, node count, replication factor, consistency level, or partition capacity.
+</Info>
+
+## StorageLayout shape
+
+```yaml
+runtime:
+  storage_layouts:
+    <layout_id>:
+      object:
+        data_model: <data_model_id>
+        object: <object_id>
+      partition_key:
+        - <field_path>
+        - ...
+```
+
+- `partition_key` is a non-empty list of field paths interpreted against the object's canonical schema.
+- Object identity and storage identity are distinct: object identity answers "which logical instance," while the layout answers "into which physical partition."
+
+## Partition key is not a routing key
+
+A partition key and a routing key may reference the same fields without becoming the same concept. They may also deliberately differ:
+
+```yaml
+# Router key defines execution-affinity domain
+Router routing key: channel_id
+
+# StorageLayout key distributes data across partitions
+StorageLayout partition_key:
+  - channel_id
+  - bucket
+```
+
+This means all work for one channel shares an execution-affinity domain while the channel's data stays distributed across partitions. Conseqa never infers equivalence between routing-domain identity and storage-partition identity merely because their key expressions coincide.
+
+It is equally valid for object identity and storage identity to differ:
+
+```yaml
+# Object identity
+identity:
+  - message_id
+
+# Storage partition key
+partition_key:
+  - channel_id
+  - bucket
+```
+
+## Full example
+
+```yaml title="StorageLayout example"
+runtime:
+  storage_layouts:
+    layout.messages:
+      object:
+        data_model: data.chat
+        object: obj.message
+      partition_key:
+        - channel_id
+        - bucket
+```
+
+## What a layout does NOT imply
+
+- Database vendor or product
+- Storage node count or topology
+- Replication factor or replica placement
+- Consistency level or read routing
+- Partition capacity or latency guarantees
+
+These physical and quantitative facts remain outside the Conseqa model.
+
+<Tip>
+  For how request routing works, see [Routers and Pools](/runtime/routers-and-pools). For the L0 data model and outbox declarations, see [Data Models and Outboxes](/concepts/data-models-and-outboxes).
+</Tip>

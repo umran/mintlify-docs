@@ -1,0 +1,114 @@
+---
+title: "Conseqa Data Models and Outboxes"
+sidebarTitle: "Data Models and Outboxes"
+description: "DataModels are logical transactional state boundaries. DataObjects carry composite identity. Outboxes are typed logical message collections owned by a data model, atomically committed with their containing transaction."
+---
+
+A `DataModel` is a logical transactional state boundary containing persistent objects. It is not necessarily one database server, one vendor product, one schema namespace, or one physical storage engine. What matters is that a transaction declaring this data model is modeled as operating against this shared transactional boundary.
+
+## Data objects and identity
+
+A `DataObject` is a logical class of persistent object instances. `schema` identifies the canonical state schema for an instance.
+
+`identity` is the complete, non-empty logical identity of one object instance. The vector contains the components of a **single composite identity**:
+
+```yaml
+identity:
+  - [tenant_id]
+  - [account_id]
+```
+
+This means the object is identified by the tuple `(tenant_id, account_id)`. It does **not** mean that `tenant_id` and `account_id` are alternative independent keys. Object identity is intrinsic to the logical object model: two distinct successfully created instances cannot share the same complete identity.
+
+### Object-history requirements are deferred
+
+A `DataObject` declares no object-history requirement (such as `linearizable`). Transaction isolation, explicit locks, lock ordering, object identity, selector overlap, transaction conflicts, operation serialization, and operation ordering keep their declared meanings. The scope rule for this iteration is:
+
+> Conseqa models transaction and operation correctness without declaring end-to-end persistent-object history consistency requirements.
+
+`serializable` continues to mean transaction serializability and must **not** be reinterpreted as linearizability.
+
+## Outboxes
+
+A data model may also contain **outboxes**: typed logical message collections belonging to the same transactional state boundary as its objects.
+
+```yaml
+data_models:
+  data.orders:
+    objects:
+      obj.Order:
+        schema: schema.Order
+        identity:
+          - [order_id]
+    outboxes:
+      outbox.order_events:
+        messages:
+          - schema.OrderCreated
+        message_identity:
+          kind: keyed
+          mapping:
+            schema.OrderCreated:
+              - event_id
+```
+
+`messages` is the set of schemas the outbox is permitted to durably contain. `message_identity` uses exactly the same `MessageIdentity` semantics as a topic: `unspecified` or `keyed { mapping }`, with the same per-schema mapping rules, arity constraints, and cross-schema collision rules.
+
+### Atomicity
+
+Because an outbox belongs to the data model, a transaction declaring that data model may atomically mutate its objects **and** admit messages to its outboxes in one logical commit:
+
+```text
+T aborts   =>  no mutation commits AND the message is not admitted
+T commits  =>  the mutations commit AND the message is durably admitted
+```
+
+There is no state of the L0 machine where the commit succeeds without the declared admission, or an admission survives an abort. This is the defining atomic-outbox property.
+
+### What an outbox is not
+
+An outbox is:
+
+- **not** a `DataObject`
+- **not** an `EffectIntent`
+- **not** a `TransactionOutput`
+
+No `DataObject` named "outbox" acquires outbox semantics; they exist only through this explicit entity. An outbox message is durable typed application message data, not a captured effect instance awaiting execution, and not a typed value exported back into the same operation's continuation.
+
+## Topic versus outbox
+
+| Concern | Topic | Outbox |
+| --- | --- | --- |
+| Layer | L0 logical channel | L0 `DataModel` entity |
+| Payload | typed message | typed message |
+| Allowed schemas | `messages` | `messages` |
+| Logical message identity | `message_identity` | `message_identity` |
+| Producer effect | publication ([Effects](/dsl/effects)) | outbox write ([Effects](/dsl/effects)) |
+| Producer execution | ordinary effect execution | transaction-exclusive |
+| Atomic with `DataObject` mutation | not implied | yes, through the containing transaction |
+| Consumer input | subscription ([Operations](/concepts/operations)) | outbox input ([Operations](/concepts/operations)) |
+| Runtime | topic/subscription runtime ([Topic and subscription runtime](/runtime/topic-and-subscription-runtime)) | outbox runtime ([Outbox runtime](/runtime/outbox-runtime)) |
+
+## Writing to an outbox
+
+Outbox messages are written only via a `write_outbox` transaction step. This is the **sole legal execution site** for an `OutboxWriteEffect`; it is rejected under `execute_effect`, `execute_effect_async`, `establish_effect_intent`, and among a transition's side effects.
+
+```yaml
+- kind: write_outbox
+  effect_id: effect.create_order.outbox_created
+  effect:
+    outbox: outbox.order_events
+    schema: schema.OrderCreated
+  values:
+    kind: deterministic
+    from:
+      - source: input:input.create_order.request
+        path: order_id
+```
+
+<Note>
+  `write_outbox` has no synchronous result, no `bind`, and no async variant. The transaction alone determines whether the staged write commits.
+</Note>
+
+## Consuming an outbox
+
+Outbox messages are consumed by an operation through an [OutboxInput](/concepts/operations). Runtime facts for that consumption are declared in an [OutboxRuntime](/runtime/outbox-runtime).

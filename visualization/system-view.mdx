@@ -1,17 +1,18 @@
 ---
-title: "System View: Services, Topics, and Routes in conseqa-viz"
+title: "System View: Services, Topics, Outboxes, and Routes in conseqa-viz"
 sidebarTitle: "System View"
-description: "Explore your full microservice architecture as an interactive SVG graph — services, topics, external systems, and every information route between them."
+description: "Explore your full microservice architecture as an interactive SVG graph — services, operations, topics, outboxes, external systems, and every information route between them."
 ---
 
-The system view is the entry point for `conseqa-viz`. It renders your entire architecture as a directed SVG graph, giving you an at-a-glance picture of what services exist, how operations communicate, and where the model's proof obligations land.
+The system view is the entry point for `conseqa-viz`. It renders your entire architecture as a directed SVG graph, giving you an at-a-glance picture of what services exist, how operations communicate, and where the model's proof obligations land. L0 (the abstract application machine) is always drawn. L1 (the optional runtime realization) can be toggled from the top bar: when enabled, runtime vertices appear as intermediate nodes on their corresponding edges.
 
 ## Layout and nodes
 
-The graph places services as boundary boxes with their operations inside. Topics, external systems, and a synthetic **Client** node sit around them:
+The graph places services as boundary boxes with their operations inside. Topics, outboxes, external systems, and a synthetic **Client** node sit around them:
 
 - **Service boxes** — each service is drawn as a named boundary box containing its operations as labeled nodes inside it.
-- **Topic nodes** (pill-shaped) — one node per declared topic.
+- **Topic nodes** (pill-shaped) — one node per declared L0 topic. Topic-scoped L1 transport facts (grouping, ordering) appear on the topic node itself when L1 is enabled.
+- **Outbox nodes** (dashed teal) — one node per declared outbox on a data model. The node belongs to the data model and is drawn distinctly from a topic, because an outbox is a transactional message collection, not a logical channel.
 - **External system nodes** — one node per external effect target.
 - A synthetic **Client** node — represents callers that invoke request inputs no modeled operation invokes.
 
@@ -21,13 +22,27 @@ Every edge in the graph corresponds to a declared information route. The style t
 
 | Kind | Direction | Meaning |
 |---|---|---|
-| Publish | Operation → Topic | An operation publishes a message to a topic |
-| Subscribe | Topic → Operation | An operation receives messages from a topic |
-| Request | Operation → Operation | An operation invokes another operation's request input |
-| External | Operation → External | An operation calls an external system |
-| Client | Client → Operation | An external caller invokes a request input |
+| Publish | Operation -> Topic | An operation publishes a message to a topic |
+| Subscribe | Topic -> Operation | An operation receives messages from a topic |
+| Outbox write | Operation -> Outbox | A transaction step admits a message to a data-model outbox |
+| Outbox input | Outbox -> Operation | An operation consumes messages from an outbox via an `OutboxInput` |
+| Request | Operation -> Operation | An operation invokes another operation's request input |
+| External | Operation -> External | An operation calls an external system |
+| Client | Client -> Operation | An external caller invokes a request input |
 
-**Dashed edges** indicate a *declared but unexecuted* capability: the effect exists on the operation but no step in its program ever executes it. A solid edge names the program step locations (for example, `2` or `3.ok.1`) that execute it in its detail panel. Effects owned by state-machine transitions are attributed to the operations that execute them through intents and marked "via transition."
+**Dashed edges** indicate a declared but unexecuted capability: the effect exists on the operation but no step in its program ever executes it. A solid edge names the program step locations (for example, `2` or `3.ok.1`) that execute it in its detail panel. Effects owned by state-machine transitions are attributed to the operations that execute them through intents and marked "via transition."
+
+Outbox edges are drawn distinctly from topic edges because the admission is atomic with a transaction's commit. The edge names the transaction whose commit admits the message. Async effect edges (async launch, `join_all`, `race`) can be surfaced in the operation view rather than the system view, because they describe intra-invocation effect overlap rather than inter-service routes.
+
+## L1 runtime overlays
+
+When L1 is enabled from the top bar, runtime facts are laid onto the L0 machine rather than shown beside it:
+
+- **Routers** and **subscription dispatches** appear as intermediate vertices on their corresponding edges: caller -> [router] -> operation, or topic -> [dispatch] -> operation. The vertex names the execution pool, its `member_concurrency`, and the routing or affinity fact.
+- **Execution pools** are named on intermediate vertices. Selecting a pool highlights every vertex that names it, reflecting the shared population.
+- **Storage layouts** appear as a downstream data tier. Access edges between operations and objects carry whether the access keys to the object's partition.
+
+L1 is disabled when the model declares no runtime facts.
 
 ## Requirement badges
 
@@ -62,4 +77,4 @@ The rule for rollup is: disproven overrides unknown, which overrides proven. A s
 
 ## Top bar
 
-When a report is loaded, the top bar gains an **Obligations** button carrying the total tally. Clicking it opens the obligations panel, which lets you browse all obligations grouped by subject, filter by status (all / unknown / proven / disproven), and expand individual cards to see the declared assumptions, checker evidence, or a counterexample trace.
+When a report is loaded, the top bar gains an **Obligations** button carrying the total tally. Clicking it opens the obligations panel, which lets you browse all obligations grouped by subject, filter by status (all / unknown / proven / disproven) and layer (any / L0 / L1), and expand individual cards to see the declared assumptions, checker evidence, or a counterexample trace.

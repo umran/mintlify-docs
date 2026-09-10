@@ -1,35 +1,29 @@
 ---
-title: "State Machines and Lifecycle Transitions in Conseqa"
+title: "Conseqa State Machines and Transition Side Effects"
 sidebarTitle: "State Machines"
-description: "State machines model persistent lifecycle transitions over data objects. Learn how to declare states, transitions, and side effects in Conseqa."
+description: "State machines define legal states and transitions for persistent object fields. Transition transactions are never naturally replayable; transition side effects are implicitly established as effect-intent artifacts."
 ---
 
-State machines model the persistent lifecycle of data objects — the progression of an order from `pending` to `paid` or `cancelled`, or a transcode job from `queued` through `running` to `done` or `failed`. You declare a state machine once and then apply its transitions inside transaction steps across any number of operations. The verifier tracks which states are reachable, enforces that transitions fire only from permitted source states, and connects transition side effects to the artifact and idempotency machinery the rest of the model uses.
+A state machine defines the legal states and legal transitions of a persistent object field.
 
-## State machine fields
+## Declaration
 
 ```yaml
 state_machines:
   machine.order_lifecycle:
-    subject:
-      kind: object
-      object: object.order
-      state: status
+    object: obj.Order
+    state: status
+    initial: pending
     states:
-      - state.order.pending
-      - state.order.paid
-      - state.order.cancelled
-    initial: state.order.pending
+      - pending
+      - paid
+      - shipped
+      - cancelled
     transitions:
-      transition.order.cancel:
-        from:
-          - state.order.pending
-        to: state.order.cancelled
-        side_effects: {}
       transition.order.mark_paid:
         from:
-          - state.order.pending
-        to: state.order.paid
+          - pending
+        to: paid
         side_effects:
           effect.order.paid:
             kind: publication
@@ -38,226 +32,80 @@ state_machines:
             idempotency_key_propagation: []
 ```
 
-| Field | Purpose |
-|---|---|
-| `subject` | Identifies which persistent object this machine governs and which field holds the state |
-| `states` | The complete enumerated set of valid states |
-| `initial` | The state every new object instance starts in |
-| `transitions` | The named transitions between states |
+### Key fields
 
-## Subject
+- **`object`** : The persistent object class governed by this machine.
+- **`state`** : The field in the object's canonical schema that stores the logical machine state.
+- **`initial`** : The initial state for a newly created logical machine instance. It does not imply that every existing persistent record is currently in that state.
+- **`Transition.from`** : The set of states from which this transition is legal.
+- **`Transition.to`** : The destination state.
 
-The `subject` declaration ties the state machine to a concrete persistent object and a field in that object's schema:
+The state machine declares legality, not concurrency safety. Two individually legal transitions can still race. The verifier must use isolation, locks, serialization, ordering, or other facts to prove that concurrent execution cannot produce an illegal history.
 
-```yaml
-subject:
-  kind: object
-  object: object.order
-  state: status
-```
+## Applying a transition
 
-`object` must reference a `DataObject` declared in a data model. `state` is the field path in the object's schema that holds the current state value. The state machine's declared `states` are the valid values of that field.
-
-## States and initial state
-
-`states` is the exhaustive list of valid state identifiers for this machine. `initial` names the state every freshly inserted object instance begins in. The verifier uses these declarations to check that transitions start from valid source states and arrive at valid target states.
-
-## Transitions
-
-Each transition declares:
-
-| Field | Purpose |
-|---|---|
-| `from` | The set of source states from which this transition may fire |
-| `to` | The target state after the transition fires |
-| `side_effects` | Effect declarations implicitly established as intents when the transition fires |
-
-A transition fires inside a `transition` transaction step. The operation that applies the transition selects the concrete object instance with a `subject` predicate.
-
-### Side effects
-
-Transition side effects are effect declarations that the transition owns as part of the shared state-machine contract. When an operation's transaction applies the transition, those side effects are automatically established as effect intents. The applying `transition` step supplies, for every side effect, the concrete payload derivation and an operation-local intent binding, all in one place.
-
-```yaml
-transitions:
-  transition.video.mark_ready:
-    from:
-      - state.video.uploaded
-    to: state.video.ready
-    side_effects:
-      effect.video.published:
-        kind: publication
-        topic: topic.video_events
-        schema: schema.VideoPublished
-        idempotency_key_propagation: []
-```
-
-When an operation applies `transition.video.mark_ready`, its `transition` step must supply an `effect_intents` entry for `effect.video.published` with a `bind` (the operation-local intent name) and a `values` derivation:
+A `transition` transaction step selects a concrete persistent machine instance and applies the named transition:
 
 ```yaml
 - kind: transition
-  machine: machine.video_lifecycle
-  transition: transition.video.mark_ready
+  machine: machine.order_lifecycle
+  transition: transition.order.mark_paid
   subject:
-    object: object.video
-    predicate:
-      kind: eq
-      field: video_id
-      value:
-        source: input:input.publish_video.completed
-        path: video_id
+    kind: eq
+    field: order_id
+    value:
+      source: input:input.apply_payment.captured
+      path: order_id
   effect_intents:
-    effect.video.published:
-      bind: intent.publish_video.published
+    effect.order.paid:
+      bind: intent.order_paid
       values:
         kind: deterministic
         from:
-          - source: input:input.publish_video.completed
-            path: event_id
-          - source: input:input.publish_video.completed
-            path: video_id
-          - source: input:input.publish_video.completed
-            path: manifest_uri
+          - source: input:input.apply_payment.captured
+            path: order_id
 ```
 
-The map's key is the state-machine transition side-effect ID. Coverage must be exact: the set of keys in `effect_intents` must match the set of `side_effects` on the transition, and each entry supplies exactly one `values` derivation and one operation-local intent binding.
+The state transition guard and update to the destination state are interpreted as one logical state transition within the surrounding transaction.
 
-After a successful commit, the bound intent is available anywhere in the operation's program where it is definitely established. Execute it with `execute_effect_intent`:
+## Transition transactions are never naturally replayable
 
-```yaml
-- kind: execute_effect_intent
-  intent: intent.publish_video.published
+A transaction containing any `Transition` is **not naturally replayable** under the current replay proof rules. A successful transition changes the state against which its own precondition was evaluated, so re-executing the transaction cannot generally be assumed to reproduce the same transaction outcome or transaction artifacts.
+
+This is a **proof fact, not a structural validity rule**. A transition-containing transaction may declare any `IdempotencyGuarantee` permitted for other transactions, and `deduplicated_by { key }` provides the durable recovery route: after the first successful logical commit, a later same-key encounter resolves the prior commit and restores the exact retained artifacts. Without `deduplicated_by`, no declared fact makes the transition's artifacts replay-available, and obligations that need them settle unproven.
+
+## Transition side effects
+
+A transition may declare publication or request side effects associated with taking that transition. These are shared model-level declarations: a state machine exists independently of any one operation and may be applied by several.
+
+For replay semantics, these side effects are treated as **implicitly established effect-intent transaction artifacts** when the transition successfully commits. They are not direct external executions inside the application-state transaction.
+
+### Transition effect intents
+
+The state-machine transition owns the effect contract; the applying `transition` transaction step owns the concrete instance provenance and the artifact binding. `effect_intents` maps each side effect declared by the applied transition to a `TransitionEffectIntent`: the operation-local `bind` and the `Derivation` used to construct that side effect's instance.
+
+The mapping must be **exact**:
+
+```text
+transition.side_effects.keys()
+==
+state_transition.effect_intents.keys()
 ```
 
-<Note>
-Transition side effects are never executed directly with `execute_effect`. They are always established as intents by the transition step and executed later through `execute_effect_intent`. This ensures the intent payload is captured atomically with the state change.
-</Note>
+Each entry supplies exactly one concrete derivation and one operation-local intent binding. Missing entries, extra entries, and entries keyed by another transition's effects are all structural validation errors. A transition without side effects declares an empty map.
 
-## How transitions appear in programs
+Each derivation is evaluated in the enclosing transaction context at the point of the `transition` step, and may reference operation-level values, transaction outputs available at that point, and preceding `transaction_read` bindings.
 
-A typical pattern for state-machine-driven operations is:
+### Important restrictions
 
-<Steps>
-  <Step title="Apply the transition inside a transaction">
-    The `transition` step changes the object's state field and atomically establishes the side-effect intents.
-  </Step>
-  <Step title="Execute the side-effect intent">
-    After the transaction commits, an `execute_effect_intent` step fires the publication or request effect whose payload was captured by the transition.
-  </Step>
-  <Step title="Terminate">
-    A `return` or `complete` step ends the operation.
-  </Step>
-</Steps>
+A transition side effect must **never** be established via `establish_effect_intent` nor executed via `execute_effect` directly. Its ID belongs to the state machine's declaration, so an inline site claiming it is a `DuplicateId`. Establishment is the transition's responsibility, and execution is `ExecuteEffectIntent`'s.
 
-```yaml
-program:
-  steps:
-    - kind: transaction
-      id: tx.publish_video.ready
-      data_model: data.videos
-      isolation: read_committed
-      idempotency:
-        kind: deduplicated_by
-        key:
-          components:
-            - source: input:input.publish_video.completed
-              path: event_id
-      steps:
-        - kind: transition
-          machine: machine.video_lifecycle
-          transition: transition.video.mark_ready
-          subject:
-            object: object.video
-            predicate:
-              kind: eq
-              field: video_id
-              value:
-                source: input:input.publish_video.completed
-                path: video_id
-          effect_intents:
-            effect.video.published:
-              bind: intent.publish_video.published
-              values:
-                kind: deterministic
-                from:
-                  - source: input:input.publish_video.completed
-                    path: event_id
-                  - source: input:input.publish_video.completed
-                    path: video_id
-                  - source: input:input.publish_video.completed
-                    path: manifest_uri
-    - kind: execute_effect_intent
-      intent: intent.publish_video.published
-    - kind: complete
-```
+A successful transition transaction logically performs the following atomically:
 
-## A complete two-machine example
+1. evaluate the state-transition guard
+2. apply the state transition
+3. construct each transition side-effect instance using its corresponding derivation
+4. establish each bound effect-intent artifact
+5. commit the transition state and established artifacts together
 
-The following is the pair of state machines from the video streaming fixture — one for the video record lifecycle and one for the transcode job lifecycle.
-
-```yaml
-state_machines:
-  machine.video_lifecycle:
-    subject:
-      kind: object
-      object: object.video
-      state: status
-    states:
-      - state.video.failed
-      - state.video.ready
-      - state.video.uploaded
-    initial: state.video.uploaded
-    transitions:
-      transition.video.mark_failed:
-        from:
-          - state.video.uploaded
-        to: state.video.failed
-        side_effects: {}
-      transition.video.mark_ready:
-        from:
-          - state.video.uploaded
-        to: state.video.ready
-        side_effects:
-          effect.video.published:
-            kind: publication
-            topic: topic.video_events
-            schema: schema.VideoPublished
-            idempotency_key_propagation: []
-
-  machine.job_lifecycle:
-    subject:
-      kind: object
-      object: object.job
-      state: status
-    states:
-      - state.job.done
-      - state.job.failed
-      - state.job.queued
-      - state.job.running
-    initial: state.job.queued
-    transitions:
-      transition.job.start:
-        from:
-          - state.job.queued
-        to: state.job.running
-        side_effects: {}
-      transition.job.complete:
-        from:
-          - state.job.running
-        to: state.job.done
-        side_effects:
-          effect.job.completed:
-            kind: publication
-            topic: topic.video_events
-            schema: schema.TranscodeCompleted
-            idempotency_key_propagation: []
-      transition.job.fail:
-        from:
-          - state.job.running
-        to: state.job.failed
-        side_effects: {}
-```
-
-## State machines in the visualization
-
-When you run `conseqa-viz model.yaml`, the visualization renders each state machine as a labeled directed graph. States appear as nodes and transitions as edges. Side effects are annotated on the relevant transition edges, making it easy to trace which state changes trigger which publications or requests. Use the `--verify` flag to overlay verification verdicts on the diagram.
+When the transaction declares `DeduplicatedBy { key }`, these derivations are evaluated only during the first successful keyed execution. A retry with the same transaction idempotency identity resolves `Commit(T,K)` and recovers the exact original artifacts without evaluating the derivations again.
