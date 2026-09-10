@@ -43,10 +43,6 @@ Conseqa is a formal model checker for distributed microservices architectures. Y
       topic.video_events:
         messages:
           - schema.VideoUploaded
-        ordering:
-          kind: keyed
-          mapping:
-            schema.VideoUploaded: video_id
         message_identity:
           kind: keyed
           mapping:

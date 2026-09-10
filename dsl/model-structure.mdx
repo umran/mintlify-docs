@@ -1,10 +1,10 @@
 ---
-title: "Conseqa DSL Model Structure: All Seven Top-Level Keys"
+title: "Conseqa DSL Model Structure: All Top-Level Keys"
 sidebarTitle: "Model Structure"
-description: "Complete reference for the top-level keys of a Conseqa YAML model: revision, services, schemas, data_models, topics, state_machines, and operations."
+description: "Reference for the top-level keys of a Conseqa YAML model: revision, services, schemas, data_models, topics, state_machines, operations, and the optional runtime block."
 ---
 
-Every Conseqa model is a single YAML file whose root object is a `Model`. The file declares one logical architecture snapshot — a revision-stamped collection of services, schemas, data objects, topics, state machines, and operations. Validation checks that all references are coherent; verification checks whether the requirements declared inside `operations` follow from the declared facts and architecture.
+Every Conseqa model is a single YAML file whose root object is a `Model`. The file declares one logical architecture snapshot: a revision-stamped collection of services, schemas, data models (with outboxes), topics, state machines, and operations, plus an optional runtime block describing how the architecture is realized. Validation checks that all references are coherent; verification checks whether the requirements declared inside `operations` follow from the declared facts and architecture.
 
 ## Top-level fields
 
@@ -25,7 +25,11 @@ Every Conseqa model is a single YAML file whose root object is a `Model`. The fi
 </ParamField>
 
 <ParamField path="topics" type="map[Id → Topic]" required>
-  A map of topic declarations. Topics carry messages between producers and consumers and declare ordering and identity guarantees.
+  A map of topic declarations. A topic carries `messages` and a `message_identity`; grouping and ordering are runtime topology facts, declared under `runtime.topics` or on a subscription runtime, not on the topic itself.
+</ParamField>
+
+<ParamField path="runtime" type="Runtime" optional>
+  Optional runtime topology: `topics`, `subscriptions`, `outboxes`, `execution_pools`, `routers`, `storage_layouts`. Facts declared here describe how the architecture is realized and may participate in proofs whose scope becomes `runtime_dependent`. Absence never invalidates a model.
 </ParamField>
 
 <ParamField path="state_machines" type="map[Id → StateMachine]" required>
@@ -91,7 +95,8 @@ schemas:
       id: order_id           # fragment field -> source field path
 
 # ── Data models ───────────────────────────────────────────────────────────
-# Logical transactional state boundaries containing persistent objects.
+# Logical transactional state boundaries containing persistent objects
+# and (optionally) typed outboxes committed atomically with those objects.
 data_models:
   data.checkout:
     objects:
@@ -99,17 +104,24 @@ data_models:
         schema: schema.OrderRecord
         identity:
           - order_id          # each entry is one field path in the composite identity tuple
+    outboxes:
+      outbox.order_events:
+        messages:
+          - schema.OrderCreated
+        message_identity:
+          kind: keyed
+          mapping:
+            schema.OrderCreated:
+              - event_id
 
 # ── Topics ────────────────────────────────────────────────────────────────
-# Named channels for event-driven message delivery.
+# Logical message channels. A topic carries messages plus a message identity;
+# grouping and ordering are runtime topology facts, declared under runtime.topics
+# or on a subscription runtime.
 topics:
   topic.order_events:
     messages:
       - schema.OrderCreated
-    ordering:
-      kind: keyed             # unspecified | unordered | global | keyed
-      mapping:
-        schema.OrderCreated: order_id
     message_identity:
       kind: keyed
       mapping:
@@ -162,9 +174,21 @@ operations:
       ordering: []
       idempotency: []
       recoverability: []
-    execution:
-      concurrency:
-        kind: unbounded
+      result_replay: []
+
+# ── Runtime (optional) ────────────────────────────────────────────────────
+# Realization facts. Every field is optional; absence never invalidates.
+# See: /runtime/overview
+runtime:
+  execution_pools:
+    pool.checkout_workers:
+      member_concurrency: unbounded   # unspecified | unbounded | bounded(n)
+  routers:
+    router.checkout:
+      boundary:
+        operation: operation.create_order
+        input: input.create_order.request
+      pool: pool.checkout_workers
 ```
 
 ---

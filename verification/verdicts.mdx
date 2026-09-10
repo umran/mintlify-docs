@@ -115,7 +115,7 @@ Coinductive proofs are sound. The minimal-counterexample argument in the semanti
 
 The `flash_checkout` example model ships with a genuine report that illustrates both outcomes:
 
-**10 proven obligations** — including serialization, ordering, and recoverability for `apply_payment` and `create_order`, and result replay for `create_order`. These operations use keyed commits, identified events, and `by_topic_key` dispatch with `bounded(1)` member concurrency.
+**10 proven obligations** — including serialization, ordering, and recoverability for `apply_payment` and `create_order`, and result replay for `create_order`. These operations use keyed commits, identified events, and subscription dispatch with `key: grouping_key`, `member_assignment: consistent_hash`, and `member_concurrency: bounded(1)` on the target pool.
 
 **4 unknown obligations** — including idempotency for `reserve_inventory`, `charge_payment`, and `create_order`. The root causes:
 
