@@ -360,7 +360,12 @@ idempotency:
 err:
   steps:
     - kind: execute_effect
-      effect: effect.charge_payment.publish_failed
+      effect_id: effect.charge_payment.publish_failed
+      effect:
+        kind: publication
+        topic: topic.order_events
+        schema: schema.PaymentFailed
+        idempotency_key_propagation: []
       values:
         kind: deterministic
         from:

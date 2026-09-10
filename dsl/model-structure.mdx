@@ -182,7 +182,8 @@ operations:
 runtime:
   execution_pools:
     pool.checkout_workers:
-      member_concurrency: unbounded   # unspecified | unbounded | bounded(n)
+      member_concurrency:
+        kind: unbounded   # kind: unspecified | unbounded | { kind: bounded, value: N }
   routers:
     router.checkout:
       boundary:

@@ -98,6 +98,7 @@ Outbox messages are written only via a `write_outbox` transaction step. This is 
   effect:
     outbox: outbox.order_events
     schema: schema.OrderCreated
+    idempotency_key_propagation: []
   values:
     kind: deterministic
     from:

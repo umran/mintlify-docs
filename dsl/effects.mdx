@@ -389,33 +389,44 @@ The binding is valid only when the underlying effect contract is result-bearing 
 An `OutboxWriteEffect` admits one typed logical message to a data-model outbox. It is the only mechanism that writes to an outbox, and it is legal exclusively inside a `write_outbox` transaction step. The write is atomic with the containing transaction commit: `T commits ⇒ mutations commit AND message admitted; T aborts ⇒ neither`.
 
 ```yaml title="write_outbox step inside a transaction"
-transaction:
+- kind: transaction
   id: tx.place_order
   data_model: data.orders
-  deduplicated_by:
+  isolation: read_committed
+  idempotency:
+    kind: deduplicated_by
     key:
-      - source: { kind: input, id: input.request }
-        path: idempotency_key
-  body:
+      components:
+        - source: input:input.place_order.request
+          path: idempotency_key
+  steps:
     - kind: insert
-      # ... writes the Order object
+      object: object.order
+      values:
+        kind: deterministic
+        from:
+          - source: input:input.place_order.request
+            path: order_id
     - kind: write_outbox
-      effect_id: eff.emit_order_placed
+      effect_id: effect.place_order.emit_placed
       effect:
         outbox: outbox.order_events
         schema: schema.OrderPlaced
         idempotency_key_propagation:
-          strategy: from_input_field
-          input: input.request
-          field: idempotency_key
+          - source:
+              components:
+                - source: input:input.place_order.request
+                  path: idempotency_key
+            target:
+              components:
+                - source: effect:effect.place_order.emit_placed
+                  path: event_id
       values:
-        - target: order_id
-          source:
-            source: { kind: transaction_output, id: out.order_id }
-            path: value
-        - target: placed_at
-          source:
-            source: { kind: input, id: input.request }
+        kind: deterministic
+        from:
+          - source: input:input.place_order.request
+            path: order_id
+          - source: input:input.place_order.request
             path: submitted_at
 ```
 

@@ -87,8 +87,16 @@ runtime:
     op.publish_order_event:
       input.outbox_order_created:
         delivery: at_least_once
+        partitioning:
+          kind: keyed
+          mapping:
+            schema.OrderCreated:
+              - account_id
+        ordering: partition
         dispatch:
           pool: pool.outbox_workers
+          member_assignment:
+            kind: consistent_hash
   execution_pools:
     pool.order_workers:
       member_concurrency:

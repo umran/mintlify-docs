@@ -19,18 +19,28 @@ Launches an inline effect concurrently with the surrounding program.
 ```yaml
 - kind: execute_effect_async
   handle: handle.charge
-  effect_id: eff.charge_payment
+  effect_id: effect.checkout.charge_payment
   effect:
     kind: request
-    target: { operation: op.payments.charge, input: input.request }
+    target:
+      operation: operation.payments.charge
+      input: input.payments.charge.request
+    schema: schema.ChargeRequest
     retry: never
     idempotency_key_propagation:
-      strategy: from_input_field
-      input: input.request
-      field: idempotency_key
+      - source:
+          components:
+            - source: input:input.checkout.request
+              path: idempotency_key
+        target:
+          components:
+            - source: effect:effect.checkout.charge_payment
+              path: request_id
   values:
-    - target: amount
-      source: { source: { kind: input, id: input.request }, path: amount }
+    kind: deterministic
+    from:
+      - source: input:input.checkout.request
+        path: amount
 ```
 
 The launch establishes only `start(A) < start(B)` between async A and any subsequent step B. It **does not** establish `complete(A) < start(B)`. Any result binding — even for a result-bearing effect — is deferred to a synchronization barrier.

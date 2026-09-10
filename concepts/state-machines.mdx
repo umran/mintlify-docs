@@ -11,8 +11,10 @@ A state machine defines the legal states and legal transitions of a persistent o
 ```yaml
 state_machines:
   machine.order_lifecycle:
-    object: obj.Order
-    state: status
+    subject:
+      kind: object
+      object: obj.Order
+      state: status
     initial: pending
     states:
       - pending
@@ -51,11 +53,13 @@ A `transition` transaction step selects a concrete persistent machine instance a
   machine: machine.order_lifecycle
   transition: transition.order.mark_paid
   subject:
-    kind: eq
-    field: order_id
-    value:
-      source: input:input.apply_payment.captured
-      path: order_id
+    object: obj.Order
+    predicate:
+      kind: eq
+      field: order_id
+      value:
+        source: input:input.apply_payment.captured
+        path: order_id
   effect_intents:
     effect.order.paid:
       bind: intent.order_paid

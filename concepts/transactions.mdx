@@ -51,6 +51,7 @@ The ordered body may contain:
   effect:
     outbox: outbox.order_events
     schema: schema.OrderCreated
+    idempotency_key_propagation: []
   values:
     kind: deterministic
     from:
